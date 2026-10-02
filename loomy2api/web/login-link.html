@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loomy2api · 登录</title>
+<style>
+:root{
+  --bg:#f7f8fa; --surface:#fff; --surface-2:#f2f4f7; --line:#e5e8ee; --line-soft:#eef1f5;
+  --ink:#161b26; --ink-2:#586074; --ink-3:#8b93a5;
+  --accent:#2f6fe4; --accent-soft:#eaf1fe; --accent-ink:#fff;
+  --ok:#0f9d58; --warn:#b26a00; --bad:#d93025;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.06);
+  --sans:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,Consolas,monospace;
+}
+[data-theme="dark"]{
+  --bg:#0c0e14; --surface:#14171f; --surface-2:#1a1e28; --line:#272c38; --line-soft:#1f232d;
+  --ink:#e6e9ef; --ink-2:#9aa3b8; --ink-3:#6b7488;
+  --accent:#5b9dff; --accent-soft:#1c2739; --accent-ink:#08111f;
+  --ok:#3ecf8e; --warn:#f5a524; --bad:#f2545b; --shadow:none;
+}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);
+  font:14px/1.6 var(--sans);display:flex;align-items:center;justify-content:center;padding:24px}
+.card{width:100%;max-width:400px;background:var(--surface);border:1px solid var(--line);
+  border-radius:12px;box-shadow:var(--shadow);padding:24px}
+h1{font-size:16px;margin:0 0 4px}
+h1 span{color:var(--ink-3);font-weight:400;font-size:12px;margin-left:6px}
+.sub{color:var(--ink-3);font-size:12.5px;margin:0 0 16px}
+.tabs{display:flex;gap:6px;background:var(--surface-2);padding:4px;border-radius:9px;margin-bottom:16px}
+.tabs button{flex:1;height:30px;border:none;background:transparent;font-size:12.5px;
+  color:var(--ink-2);font-weight:500;cursor:pointer;border-radius:7px}
+.tabs button.on{background:var(--surface);color:var(--accent);font-weight:650;box-shadow:var(--shadow)}
+.qrbox{width:220px;height:220px;margin:0 auto 12px;display:flex;align-items:center;
+  justify-content:center;background:var(--surface-2);border:1px solid var(--line);border-radius:10px}
+.qrbox img{width:200px;height:200px;display:block}
+.qrbox.stale{opacity:.35}
+.status{text-align:center;font-size:13px;color:var(--ink-2);min-height:22px;margin-bottom:12px}
+.status .spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;
+  border-right-color:transparent;border-radius:50%;animation:sp .7s linear infinite;
+  vertical-align:-1px;margin-right:5px}
+@keyframes sp{to{transform:rotate(360deg)}}
+label{display:block;color:var(--ink-2);font-size:12px;margin:0 0 5px;font-weight:500}
+input{width:100%;height:37px;padding:0 12px;font-size:13.5px;background:var(--surface);
+  border:1px solid var(--line);border-radius:9px;color:var(--ink);margin-bottom:10px}
+input:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 14%,transparent)}
+button.primary{width:100%;height:38px;background:var(--accent);border:none;color:var(--accent-ink);
+  font-size:13.5px;font-weight:600;border-radius:9px;cursor:pointer;font-family:inherit}
+button.primary:hover{filter:brightness(1.08)}
+button.primary:disabled{opacity:.5;cursor:not-allowed}
+.msg{margin-top:12px;padding:9px 12px;border-radius:9px;font-size:13px;display:none}
+.msg.on{display:block}
+.msg.err{background:color-mix(in srgb,var(--bad) 10%,transparent);color:var(--bad);
+  border:1px solid color-mix(in srgb,var(--bad) 24%,transparent)}
+.msg.ok{background:color-mix(in srgb,var(--ok) 10%,transparent);color:var(--ok);
+  border:1px solid color-mix(in srgb,var(--ok) 24%,transparent)}
+.done{text-align:center;padding:6px 0}
+.done .big{font-size:38px}
+.hint{color:var(--ink-3);font-size:12px;margin-top:12px;line-height:1.7}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>loomy2api<span>添加账号</span></h1>
+  <p class="sub">在这里完成登录，面板会<b>自动收到登录态</b>并把它加入账号池。</p>
+
+  <div class="tabs">
+    <button id="tQr" class="on">微信扫码</button>
+    <button id="tPwd">手机号 + 密码</button>
+  </div>
+
+  <!-- 微信扫码 -->
+  <div id="paneQr">
+    <div class="qrbox" id="qrBox"><span class="hint">正在生成二维码…</span></div>
+    <div class="status" id="st"></div>
+  </div>
+
+  <!-- 手机号 + 密码 -->
+  <div id="panePwd" class="hide">
+    <label for="phone">手机号</label>
+    <input id="phone" type="tel" maxlength="11" placeholder="13800000000" autocomplete="tel">
+    <label for="pass">密码</label>
+    <input id="pass" type="password" placeholder="讯飞账号中心设置过一次的密码" autocomplete="current-password">
+    <button class="primary" id="btnPwd">登录并加入账号池</button>
+    <div class="hint">密码需先在<b>讯飞账号中心</b>设置一次（account.xunfei.cn）。设过之后这台面板可以无人值守自动续期。</div>
+  </div>
+
+  <!-- 成功 -->
+  <div id="paneDone" class="done hide">
+    <div class="big">✅</div>
+    <div style="font-weight:650" id="doneTitle"></div>
+    <div class="hint" id="doneInfo"></div>
+  </div>
+
+  <div class="msg" id="msg"></div>
+  <div class="hint">本页只与你本机的 loomy2api 通信。完成后可直接关闭，面板里会自动出现这个账号。</div>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const KEY = localStorage.getItem('loomy2api_key') || '';
+const STATE = new URLSearchParams(location.search).get('state') || '';
+try {
+  const t = localStorage.getItem('loomy2api_theme') || 'light';
+  const dark = t === 'dark' || (t === 'system' &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+} catch (e) {}
+
+function show(text, kind) {
+  const el = $('msg');
+  el.className = 'msg on ' + (kind || 'info');
+  el.innerHTML = text;
+}
+function hide() { $('msg').className = 'msg'; }
+
+async function api(path, body) {
+  const headers = {};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  if (body) headers['Content-Type'] = 'application/json';
+  const res = await fetch(path, { method: body ? 'POST' : 'GET', headers,
+                                  body: body ? JSON.stringify(body) : undefined });
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    const raw = data && data.error;
+    throw new Error((raw && (raw.message || raw)) || ('HTTP ' + res.status));
+  }
+  return data;
+}
+
+/* ---------- 页签 ---------- */
+function tab(name) {
+  $('tQr').classList.toggle('on', name === 'qr');
+  $('tPwd').classList.toggle('on', name === 'pwd');
+  $('paneQr').classList.toggle('hide', name !== 'qr');
+  $('panePwd').classList.toggle('hide', name !== 'pwd');
+}
+$('tQr').onclick = () => tab('qr');
+$('tPwd').onclick = () => tab('pwd');
+
+/* ---------- 微信扫码（服务端长轮询取 code） ---------- */
+let QR_TIMER = null;
+
+function st(text, kind) { const el = $('st'); if (el) el.innerHTML = text ? (kind === 'spin' ? '<span class="spin"></span>' + text : text) : ''; }
+
+function stopQr() { if (QR_TIMER) { clearTimeout(QR_TIMER); QR_TIMER = null; } }
+
+async function qrPoll() {
+  if (!STATE) return;
+  try {
+    const r = await api('/api/panel/login/wechat/qr/poll', { state: STATE });
+    if (r.status === 'waiting') { st(r.text || '等待扫码…', 'spin'); return schedule(); }
+    if (r.status === 'scanned') { st('已扫码，请在手机上点「确认登录」', 'spin'); return schedule(); }
+    if (r.status === 'cancelled') {
+      stopQr(); $('qrBox').classList.add('stale'); st('已在手机上取消');
+      return show('你取消了授权，刷新本页可重新扫码。', 'err');
+    }
+    if (r.status === 'expired') {
+      stopQr(); $('qrBox').classList.add('stale'); st('二维码已过期');
+      return show('二维码已过期，刷新本页可重新生成。', 'err');
+    }
+    if (r.needs_phone) {
+      stopQr(); $('qrBox').classList.add('stale'); st('已授权');
+      show('微信已授权，但还没绑手机号 —— 请切到「手机号 + 密码」用手机号收短信完成绑定（即注册）。', 'err');
+      return;
+    }
+    finish(r);
+  } catch (e) {
+    st('网络波动，继续重试…', 'spin');
+    schedule();
+  }
+}
+function schedule() { QR_TIMER = setTimeout(qrPoll, 800); }
+
+/* ---------- 手机号 + 密码 ---------- */
+async function pwdLogin() {
+  const phone = $('phone').value.trim(), pass = $('pass').value;
+  if (!/^1[3-9]\d{9}$/.test(phone)) return show('手机号格式不对（11 位，1 开头）', 'err');
+  if (!pass) return show('请输入密码', 'err');
+  const btn = $('btnPwd');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const r = await api('/api/panel/accounts', { method: 'POST',
+      body: JSON.stringify({ name: '', loginid: phone, password: pass, login: true }) });
+    if (r.logged_in === false) throw new Error(r.error || '登录失败');
+    finish(r);
+  } catch (e) {
+    show('登录失败：' + e.message, 'err');
+    btn.disabled = false; btn.textContent = '登录并加入账号池';
+  }
+}
+$('btnPwd').onclick = pwdLogin;
+$('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') pwdLogin(); });
+
+/* ---------- 完成 ---------- */
+function finish(r) {
+  stopQr();
+  $('paneQr').classList.add('hide');
+  $('panePwd').classList.add('hide');
+  $('paneDone').classList.remove('hide');
+  $('doneTitle').textContent = '已加入账号池：' + (r.account || r.name || '');
+  const q = (r.available === null || r.available === undefined) ? '' : (' · 可用积分 ' + r.available);
+  $('doneInfo').innerHTML = (r.userid ? 'userid ' + r.userid + '<br>' : '') + q +
+    '<br>可以关闭本页了 —— 面板里已经自动出现这个账号。';
+  hide();
+}
+
+/* ---------- 启动：拉二维码并开始轮询 ---------- */
+async function boot() {
+  if (!STATE) {
+    show('缺少 state 参数。请回到面板点「生成登录链接」。', 'err');
+    $('qrBox').innerHTML = '<span class="hint">无 state</span>';
+    return;
+  }
+  try {
+    const r = await api('/api/panel/login/wechat/qr/start', { name: '' });
+    const img = document.createElement('img');
+    img.src = r.qr_url; img.alt = '微信扫码';
+    const box = $('qrBox');
+    box.innerHTML = ''; box.appendChild(img);
+    st('等待扫码…', 'spin');
+    qrPoll();
+  } catch (e) {
+    $('qrBox').innerHTML = '<span class="hint">生成失败</span>';
+    show('生成二维码失败：' + e.message, 'err');
+  }
+}
+boot();
+</script>
+</body>
+</html>

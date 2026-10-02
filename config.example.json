@@ -1,0 +1,60 @@
+{
+  "_comment": "Copy to config.json and edit. Every key is optional — defaults live in loomy2api/config.py. Environment variables override this file (see README). 改完保存即热生效（面板「在线配置」也能改）。",
+
+  "host": "127.0.0.1",
+  "port": 17890,
+
+  "upstream": "https://loomyad.xunfei.cn/api/v1",
+  "account_base": "https://account.xfinfr.com",
+  "account_appid": "GM3LOOMY",
+
+  "_access_key": "Leave empty to use the constants shipped with the official client. Override if your client ships a different pair.",
+  "access_key_id": "",
+  "access_key_secret": "",
+
+  "loomy_version": "0.9.38",
+  "_proxy": "empty = direct connection (recommended for these domestic endpoints)",
+  "proxy": "",
+
+  "_api_keys": "empty list = the gateway needs no key. Set e.g. [\"sk-abc\"] to require Bearer/x-api-key. 首启自动生成时这里会是随机 Key。",
+  "api_keys": [],
+
+  "default_model": "deepseek-v4-flash-0731",
+  "_models": "Upstream model ids are used verbatim — no alias table. See GET /v1/models for the catalogue.",
+
+  "timeout": 1200,
+  "request_purpose": "chat.message",
+  "log_dir": "logs",
+  "log_requests": true,
+  "log_console": true,
+  "strip_model_prefix": true,
+
+  "_pool": "accounts_file holds your accounts (gitignored). strategy: weighted | balance | round_robin | lru",
+  "accounts_file": "accounts.json",
+  "strategy": "weighted",
+  "_identity": "per_account = each account gets its own devid + promotions device id, bound on first login; client = mirror the shipped client exactly (devid: web)",
+  "identity_mode": "per_account",
+  "max_retries": 2,
+  "cooldown_seconds": 300,
+  "session_renew_before_days": 3,
+  "quota_refresh_minutes": 30,
+  "sessions_from_client": false,
+
+  "_routing": "选号/冷却/粘性（借鉴 workbuddy2api-panel）。weighted = 三因子加权(余额×10 + 闲置×1 + 成功率×3) Top-N 抽签，防惊群。",
+  "pick_top_n": 5,
+  "soft_rate_base_seconds": 600,
+  "soft_rate_max_seconds": 7200,
+  "not_found_cooldown_seconds": 60,
+  "breaker_threshold": 5,
+  "breaker_cooldown_seconds": 60,
+  "breaker_cooldown_max_seconds": 1800,
+  "_sticky": "同一会话尽量落在同一账号，保住多轮上下文；0 = 关闭",
+  "sticky_ttl_seconds": 1800,
+  "sticky_max_entries": 2000,
+  "_inflight": "单账号在途请求上限（0 = 不限）。账号被并发打爆时设 1~3。",
+  "max_inflight_per_account": 0,
+
+  "_security": "面板响应加 CSP/nosniff 等安全头；首启自动生成 config.json（含随机 api_key）",
+  "security_headers": true,
+  "auto_generate_config": true
+}

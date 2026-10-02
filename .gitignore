@@ -1,0 +1,40 @@
+# ---- runtime / secrets (never commit) ----
+config.json
+accounts.json
+session.json
+credentials.json
+api-key.txt
+logs/
+*.log
+_decrypt_env.cjs
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- editors / os ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# prototype single-file scripts (kept locally, not published)
+legacy/
+_port_probe.txt
+.playwright-cli/
+state/last_sms.json
+
+
+# ---- local state (never commit) ----
+state/
+.playwright-cli/
+*.jsonl
+last_sms.json
