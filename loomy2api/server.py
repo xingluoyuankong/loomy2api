@@ -364,7 +364,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.gateway.panel.usage(
                     limit=limit, window_hours=window, upstream=upstream))
             if path == "/api/panel/points":
-                return self._json(200, self.gateway.panel.points(refresh=False))
+                from urllib.parse import parse_qs as _pqs, urlparse as _pu
+                refresh = (_pqs(_pu(self.path).query).get("refresh")
+                           or ["0"])[0] in ("1", "true")
+                return self._json(200, self.gateway.panel.points(refresh=refresh))
             if path == "/api/panel/models":
                 return self._json(200, self.gateway.panel.models_view())
             if path == "/api/panel/tasks":
