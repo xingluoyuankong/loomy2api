@@ -37,7 +37,9 @@ DEFAULTS: Dict[str, Any] = {
     "api_keys": [],               # [] = no auth; otherwise Bearer / x-api-key
     "panel_password": "",         # 面板登录密码（空 = 面板不需要登录，仅限内网/隧道）
     "default_model": C.DEFAULT_MODEL,
-    "timeout": 1200,
+    # 上游 socket 超时（秒）。非流式长任务（超长输出）经常 >20min，
+    # 1200s 只够 ~36K token@30tok/s —— 提到 3600s 一小时兜底。
+    "timeout": 3600,
     "request_purpose": "chat.message",
     "log_dir": "logs",
     "log_requests": True,

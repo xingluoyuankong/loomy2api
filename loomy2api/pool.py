@@ -609,6 +609,12 @@ class AccountPool:
             acc.cool(float(self.cfg.get("not_found_cooldown_seconds") or 60),
                      "soft", acc.last_error)
             self.log(f"账号 {acc.name} HTTP 404 → 短冷却 60s")
+        elif status in (400, 422):
+            # 请求本身不合法（上游 invalid_request_error），换一个账号结果
+            # 一样 —— 之前的实现会冷却账号 300s，客户端一个坏请求就能把
+            # 唯一账号打入冷宫、整个池子瘫痪（01:38~02:25 事故实锤）。
+            self.log(f"账号 {acc.name} HTTP {status} → 请求不合法，不冷却账号"
+                     f"（{acc.last_error[:120]}）")
         elif status >= 500:
             # 上游挂了，不是账号的错 —— 只累计熔断器，不做冷却
             threshold = int(self.cfg.get("breaker_threshold") or 5)

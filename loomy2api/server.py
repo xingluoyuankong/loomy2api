@@ -210,16 +210,50 @@ class Handler(BaseHTTPRequestHandler):
     def _drain(self) -> None:
         if self._body_read:
             return
+        self._body_read = True
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            self._read_chunked()                    # 读掉并丢弃
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        self._body_read = True
         if length:
             try:
                 self.rfile.read(length)
-            except Exception:                           # noqa: BLE001
+            except Exception:                       # noqa: BLE001
                 pass
+
+    def _read_chunked(self) -> bytes:
+        """读 chunked 请求体（``Transfer-Encoding: chunked``）。
+
+        之前只认 Content-Length：大 prompt 的客户端一旦用 chunked 传输，
+        请求体被整段丢弃 → 上游收到空 messages → 400，还会误冷却账号。
+        """
+        data = bytearray()
+        try:
+            while True:
+                line = self.rfile.readline(65536).strip()
+                if b";" in line:
+                    line = line.split(b";", 1)[0]
+                try:
+                    size = int(line, 16)
+                except ValueError:
+                    break
+                if size == 0:                       # 最后一块 → 读 trailer
+                    while True:
+                        trailer = self.rfile.readline(65536)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                data += self.rfile.read(size)
+                self.rfile.read(2)                  # 块尾 CRLF
+                if len(data) > 64 * 1024 * 1024:    # 64MB 防护
+                    break
+        except Exception:                           # noqa: BLE001
+            pass
+        return bytes(data)
 
     def _query_int(self, name: str, default: int) -> int:
         from urllib.parse import parse_qs, urlparse as _urlparse
@@ -233,6 +267,9 @@ class Handler(BaseHTTPRequestHandler):
         if self._body_read:
             return b""
         self._body_read = True
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            return self._read_chunked()
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -691,6 +728,13 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(req.get("stream"))
         skey = session_key(req)                 # 会话粘性键（可能为 None）
 
+        # 空 messages 直接 400 快速失败：不打上游、不占账号、不冷却。
+        # 之前这种请求会打到上游吃 400，再被 report_failure 冷却唯一账号
+        # 300s，整个池子瘫痪（01:38~02:25 事故实锤）。
+        if not (req.get("messages") or []):
+            return self._error(400, "messages 不能为空（请求体解析失败或客户端未传）",
+                               "invalid_request_error")
+
         extra: Dict[str, str] = {}
         for src, dst in (("chat_id", "ChatId"), ("msg_id", "MsgId"),
                          ("turn_id", "TurnId")):
@@ -867,6 +911,9 @@ class Handler(BaseHTTPRequestHandler):
     def _messages(self) -> None:
         gw = self.gateway
         req = self._read_json()
+        if not (req.get("messages") or req.get("prompt")):
+            return self._error(400, "messages 不能为空（请求体解析失败或客户端未传）",
+                               "invalid_request_error")
         payload = anth.anthropic_to_openai(req)
         payload["model"] = gw.resolve_model(payload.get("model"))
         model = payload["model"]

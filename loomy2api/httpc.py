@@ -71,7 +71,7 @@ def request(url: str, *, method: str = "GET", headers: Optional[dict] = None,
 
 
 def open_stream(url: str, *, method: str = "POST", headers: Optional[dict] = None,
-                body: Optional[bytes] = None, timeout: float = 1200,
+                body: Optional[bytes] = None, timeout: float = 3600,
                 proxy: str = ""):
     """Open a connection without consuming the body → ``(conn, response)``.
 

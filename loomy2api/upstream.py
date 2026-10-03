@@ -300,7 +300,7 @@ class ModelGateway:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
         return http_request(
             self._url(suffix), method=method, headers=self._headers(session, extra_headers),
-            body=body, timeout=float(self.cfg.get("timeout") or 1200),
+            body=body, timeout=float(self.cfg.get("timeout") or 3600),
             proxy=self._proxy(proxy))
 
     def stream(self, session: str, suffix: str, payload: Dict[str, Any],
@@ -310,7 +310,7 @@ class ModelGateway:
         return open_stream(
             self._url(suffix), method="POST",
             headers=self._headers(session, extra_headers), body=body,
-            timeout=float(self.cfg.get("timeout") or 1200),
+            timeout=float(self.cfg.get("timeout") or 3600),
             proxy=self._proxy(proxy))
 
 
