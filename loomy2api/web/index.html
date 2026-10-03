@@ -484,8 +484,8 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             <code class="mono" id="keyBaseUrl" style="font-size:16px;font-weight:600">—</code>
             <button class="icon" id="keyCopyUrl" data-copy="https://your-domain.example/v1" title="复制 Base URL">⧉</button>
           </div>
-          <div style="margin-top:12px">
-            <span style="font-size:13px;color:var(--ink-3)">备用域名（推荐 · 正式 https 证书）</span>
+          <div style="margin-top:10px">
+            <span style="font-size:13px;color:var(--ink-3)">备用域名（额外兜底 · 不用可忽略）</span>
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
               <code class="mono" style="font-size:14px;font-weight:600">https://loomy.your-server-ip.nip.io/v1</code>
               <button class="icon" data-copy="https://loomy.your-server-ip.nip.io/v1" title="复制备用域名（主推）">⧉</button>
@@ -514,17 +514,20 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             <button class="lg" id="keyCopyAll">⧉ 复制整套（URL + Key）</button>
           </div>
           <div class="note info on" style="margin-top:12px;font-size:12px">
-            <b>⚠ 域名解析不了？</b>主域名的解析链必须经 <code>your-dns.example</code>（DNSHE 免费 DNS，
+            <b>⚠ 主域名偶发解析不了？</b>主域名的解析链必须经 <code>your-dns.example</code>（DNSHE 免费 DNS，
             <code>ns.example-dns.org</code>）这一跳，它在国内<b>偶发超时</b> → 客户端报
-            <code>getaddrinfo ENOTFOUND your-domain.example</code>（实测各家 DNS 有丢包）。<br>
-            <b>解法：换用上面的备用域名</b> —— 由 nip.io / sslip.io 的权威 DNS 直接解析到本机，
-            <b>完全绕开 example-dns.org</b>，实测国内 25/25 成功，且<b>证书有效、无需忽略校验</b>：<br>
-            ① <b>主推</b> <code>https://loomy.your-server-ip.nip.io/v1</code>（带 loomy 前缀，像域名）<br>
-            ② <b>更快</b> <code>https://your-server-ip.sslip.io/v1</code>（延迟 ~83ms）<br>
-            ③ 兜底 IP 直连 <code>http://your-server-ip/v1</code>（客户端只认 IP 时用）<br>
-            ④ 想继续用主域名：客户端机器 hosts 加
-            <code>203.0.113.10 your-domain.example</code>，或把 DNS 改成
-            <code>114.114.114.114</code>（实测 15/15 稳定）。
+            <code>getaddrinfo ENOTFOUND your-domain.example</code>。
+            <b>域名本身和证书都没问题</b>，只是这一跳会抖。<br>
+            <b>想继续用主域名</b>（推荐，域名一字不改、证书照常有效）：<br>
+            ① <b>最稳</b>：客户端机器 hosts 加一行
+            <code>203.0.113.10 your-domain.example</code> —— 实测<b>直连 + SNI 用原域名
+            返回 200、证书有效</b>，绕过 example-dns.org 那一跳；<br>
+            ② <b>最省事</b>：把客户端/路由器的 DNS 改成 <code>114.114.114.114</code>（实测 15/15 稳定，
+            次选 <code>8.8.8.8</code>），域名照原样用。<br>
+            <b>备用域名</b>（额外兜底，由 nip.io/sslip.io 权威 DNS 解析，绕开 example-dns.org，
+            不影响主域名，可不用）：<br>
+            ③ <code>https://loomy.your-server-ip.nip.io/v1</code>
+            ④ <code>https://your-server-ip.sslip.io/v1</code>
           </div>
           <div class="hint" style="margin-top:10px;font-size:12px">
             用法：<code>Authorization: Bearer &lt;API Key&gt;</code>（OpenAI SDK 直接可用）。
