@@ -408,10 +408,13 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
         <table><thead><tr><th>模型 id</th><th>名称</th><th>倍率</th><th>实测积分/次</th><th>上下文</th><th>能力</th><th></th></tr></thead>
         <tbody id="mdRows"><tr><td colspan="7" class="empty">—</td></tr></tbody></table>
         <div class="hint" style="margin-top:10px">
-          <b>计费（12 次真实扣费逆向，全部吻合）</b>：<br>
-          · <b>对话</b>：每次<b>保底 1 分</b>；输出超过 1000/倍率 token 后按
-          <code>ceil(completion ÷ 1000 × 倍率)</code> 加收（prompt 不计费，思考 token 计入输出）。
-          例：deepseek(x3.0) 输出 887 tok → 3 分；qwen-max(x12) 输出 34 tok → 保底 1 分。<br>
+          <b>计费（真实扣费实测）</b>：<br>
+          · <b>对话</b>：每次<b>保底 1 分</b>；<b>输入（prompt）和输出（completion）都要计费</b>，
+          思考 token 计入输出。<br>
+          　实测（deepseek x3.0，输出固定 ~20 tok，只改输入长度）：
+          95 输入 → <b>1 分</b>（保底）｜24k 输入 → <b>21 分</b>｜240k 输入 → <b>184 分</b>。<br>
+          　<b>⇒ 长对话历史才是主要成本</b>：agent / 多轮对话每轮都会把完整历史当 prompt 重发，
+          压上下文比压输出省钱得多。<br>
           · <b>生图</b>：<b>110 分/次</b>（三个生图模型同价，实测）。<br>
           · <b>思考等级实测</b>：reasoning_effort 各档位对思考长度影响不显著且不单调
           （deepseek 五档 rtok=248/203/153/275/133）——推理模型无论如何都会思考，
