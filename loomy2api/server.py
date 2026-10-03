@@ -1144,6 +1144,38 @@ class Handler(BaseHTTPRequestHandler):
         if req.get("stream"):
             return self._messages_stream(payload, model, skey)
 
+        # 长任务：内部转流式取数再聚合（上游非流式 ~60s 就 504），
+        # 拿到 OpenAI JSON 后同样走 anthropic 转换，客户端无感。
+        min_tok = int(gw.cfg.get("keepalive_min_tokens") or 1500)
+        if int(payload.get("max_tokens") or 0) >= min_tok:
+            self._chunked_open()
+            try:
+                res = self._run_with_keepalive(
+                    lambda: self._chat_stream_to_json(payload, {}, model, skey))
+            except Exception as exc:                    # noqa: BLE001
+                res = (502, json.dumps({"error": {
+                    "message": str(exc), "type": "upstream_error", "code": 502}
+                }).encode("utf-8"))
+            if not res:
+                return                                  # 客户端已断开
+            status, data = res
+            if not data:
+                data = json.dumps({"error": {
+                    "message": "所有账号都失败了 / all accounts failed",
+                    "type": "upstream_error", "code": 502}}).encode("utf-8")
+            try:
+                obj = json.loads(data.decode("utf-8"))
+            except Exception:                           # noqa: BLE001
+                obj = None
+            if status == 200 and isinstance(obj, dict) and obj.get("choices"):
+                out = json.dumps(anth.openai_to_anthropic(obj, model),
+                                 ensure_ascii=False).encode("utf-8")
+            else:
+                out = data                              # 上游错误体原样透传
+            self._chunk_write(out)
+            self._chunk_close()
+            return
+
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
