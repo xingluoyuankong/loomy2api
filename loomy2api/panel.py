@@ -408,6 +408,7 @@ class Panel:
                 "quota_updated_at": acc.quota_updated_at,
                 "error": detail.get("error", ""),
                 "records": detail.get("records") or [],
+                "records_total": detail.get("records_total"),
                 "expiring": detail.get("expiring"),
                 "total": detail.get("total"),
                 "model_pricing": detail.get("model_pricing") or {},
