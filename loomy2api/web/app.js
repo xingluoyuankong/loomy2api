@@ -46,6 +46,7 @@ async function doLogin() {
     if (!res.ok) throw new Error(d.error && d.error.message || ('HTTP ' + res.status));
     KEY = d.api_key || '';
     localStorage.setItem('loomy2api_key', KEY);
+    try { $('apiKey').value = KEY; } catch (e) {}
     $('loginVeil').classList.remove('on');
     $('loginPw').value = '';
     toast('登录成功', 'ok');
@@ -1017,6 +1018,25 @@ function init() {
   $('pRefresh').onclick = () => loadPoints(true);
   $('pgRun').onclick = pgRun;
   $('loginBtn').onclick = doLogin;
+  $('showKey').onclick = () => {
+    const el = $('apiKey');
+    el.type = el.type === 'password' ? 'text' : 'password';
+  };
+  $('copyKey').onclick = async () => {
+    const v = $('apiKey').value.trim();
+    if (!v) return toast('当前没有 API Key', 'err');
+    try {
+      await navigator.clipboard.writeText(v);
+      toast('API Key 已复制到剪贴板', 'ok');
+    } catch (e) {
+      // 剪贴板 API 不可用（非安全上下文等）→ 选中输入框内容兜底
+      const el = $('apiKey');
+      el.type = 'text';
+      el.focus(); el.select();
+      document.execCommand('copy');
+      toast('API Key 已复制', 'ok');
+    }
+  };
   $('loginPw').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
   $('pCheckin').onclick = doCheckin;
   $('tCheckin').onclick = doCheckinView;
