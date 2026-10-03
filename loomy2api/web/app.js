@@ -73,6 +73,29 @@ async function copyBtnFeedback(btn, text, okMsg) {
   toast(okMsg, 'ok');
 }
 
+/**
+ * 首屏自举：本地没存 Key 时，向 /api/panel/apikey 要一次。
+ * 该接口只放行已通过 nginx Basic Auth 的来源（反代注入 X-Panel-Auth），
+ * 所以浏览器打开面板后能直接拿到 Key；拿不到就静默失败，走正常登录流程。
+ *
+ * 这个函数此前**只有调用没有定义**，会在 init() 里抛 ReferenceError，
+ * 导致后面的 show() 和 setInterval() 全部不执行 —— 面板看着能用，
+ * 但自动轮询是死的。必须定义在 init 之前可达的作用域。
+ */
+async function bootstrapKey() {
+  if (KEY) return;
+  try {
+    const d = await api('/api/panel/apikey');
+    if (d && d.api_key) {
+      KEY = d.api_key;
+      localStorage.setItem('loomy2api_key', KEY);
+      const el = $('apiKey');
+      if (el) el.value = KEY;
+    }
+  } catch (e) {                    // 未通过面板认证 —— 等用户登录，不阻塞初始化
+  }
+}
+
 // 面板登录：首次/凭证失效时弹出，密码换 api_key，之后全程 x-api-key
 function showLogin() {
   $('loginVeil').classList.add('on');
