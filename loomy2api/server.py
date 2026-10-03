@@ -207,6 +207,64 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self._json(status, {"error": {"message": message, "type": kind, "code": status}})
 
+    # -- chunked 保活：防 Cloudflare 60~100s 504 -------------------------
+
+    def _chunked_open(self) -> None:
+        """开一个 chunked 响应（不带 Content-Length，可边算边发）。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+    def _chunk_write(self, data: bytes) -> bool:
+        """写一个 chunk；客户端已断开时返回 False。"""
+        try:
+            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+            self.wfile.flush()
+            return True
+        except Exception:                               # noqa: BLE001
+            return False
+
+    def _chunk_close(self) -> None:
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def _run_with_keepalive(self, fn, interval: float = 15.0):
+        """阻塞调用上游期间，定期写 JSON 合法的前导空白保活。
+
+        Cloudflare 免费版对「无字节流动」的请求约 60~100s 就返回 504 ——
+        非流式长任务（写长文 / 长代码）必然被掐（实测 62s 即 504）。
+        chunked + 空白前缀让连接持续有字节流动；RFC 8259 允许 JSON 值
+        前后有空白，客户端 ``json.loads()`` 直接忽略，解析不受影响。
+        """
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                box["value"] = fn()
+            except Exception as exc:                    # noqa: BLE001
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        last = time.time()
+        while not done.wait(0.4):
+            if time.time() - last >= interval:
+                if not self._chunk_write(b" "):         # 前导空白，JSON 合法
+                    return None                         # 客户端已断开
+                last = time.time()
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
     def _drain(self) -> None:
         if self._body_read:
             return
@@ -749,54 +807,81 @@ class Handler(BaseHTTPRequestHandler):
         if stream:
             return self._chat_stream(req, extra, model, skey)
 
-        tried: list = []
-        last: Tuple[int, bytes] = (0, b"")
-        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
-            try:
-                acc = gw.pool.acquire(exclude=tried, model=model,
-                                      session_key_value=skey)
-            except PoolError as exc:
-                gw.log(f"[warn] {exc}")
-                break
-            tried.append(acc.name)
-            started = time.time()
-            try:
-                status, _hdrs, data = gw.models_client.call(
-                    acc.session, "chat/completions", req, extra,
-                    proxy=acc.proxy or None)
-            finally:
-                gw.pool.release(acc)
-            if status == 200:
+        def core() -> Tuple[int, bytes]:
+            """调上游（含重试）→ ``(status, body)``，不负责写响应。"""
+            tried: list = []
+            last: Tuple[int, bytes] = (0, b"")
+            for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
                 try:
-                    obj = json.loads(data.decode("utf-8"))
-                except Exception:                       # noqa: BLE001
-                    obj = None
-                usage = (obj or {}).get("usage") or {}
-                elapsed = time.time() - started
-                gw.pool.report_success(acc, usage, model=model)
-                gw.usage.record(account=acc.name, model=model, status=200, usage=usage,
-                                latency=elapsed, kind="chat", proxy=acc.proxy)
-                gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s http=200 "
-                       f"{human_usage(usage)}{_rate(usage, elapsed)}")
-                return self._json(200, obj)
-            last = (status, data)
-            reason = data[:200].decode("utf-8", "replace")
-            gw.usage.record(account=acc.name, model=model, status=status,
-                            latency=time.time() - started, kind="chat",
-                            error=reason, proxy=acc.proxy)
-            if status in self.ACCOUNT_FAULT:
-                gw.log(f"[call] {acc.name} {model} http={status} → 账号问题，换账号重试")
-                gw.pool.report_failure(acc, status, reason, model=model)
-                if skey:
-                    gw.pool.sticky.unbind(skey, acc.name)   # 失败解绑，下次重新分配
-            else:
-                # upstream hiccup (502/504/500) — do NOT punish the account for it
-                gw.pool.report_failure(acc, status, reason, model=model)
-                gw.log(f"[call] {acc.name} {model} http={status} → 上游异常，换账号重试"
-                       f"（不冷却该账号）")
-            if status in self.FATAL_REQUEST:            # not an account problem
-                break
-        status, data = last
+                    acc = gw.pool.acquire(exclude=tried, model=model,
+                                          session_key_value=skey)
+                except PoolError as exc:
+                    gw.log(f"[warn] {exc}")
+                    break
+                tried.append(acc.name)
+                started = time.time()
+                try:
+                    status, _hdrs, data = gw.models_client.call(
+                        acc.session, "chat/completions", req, extra,
+                        proxy=acc.proxy or None)
+                finally:
+                    gw.pool.release(acc)
+                if status == 200:
+                    try:
+                        obj = json.loads(data.decode("utf-8"))
+                    except Exception:                   # noqa: BLE001
+                        obj = None
+                    usage = (obj or {}).get("usage") or {}
+                    elapsed = time.time() - started
+                    gw.pool.report_success(acc, usage, model=model)
+                    gw.usage.record(account=acc.name, model=model, status=200,
+                                    usage=usage, latency=elapsed, kind="chat",
+                                    proxy=acc.proxy)
+                    gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s http=200 "
+                           f"{human_usage(usage)}{_rate(usage, elapsed)}")
+                    return (200, data)
+                last = (status, data)
+                reason = data[:200].decode("utf-8", "replace")
+                gw.usage.record(account=acc.name, model=model, status=status,
+                                latency=time.time() - started, kind="chat",
+                                error=reason, proxy=acc.proxy)
+                if status in self.ACCOUNT_FAULT:
+                    gw.log(f"[call] {acc.name} {model} http={status} → 账号问题，换账号重试")
+                    gw.pool.report_failure(acc, status, reason, model=model)
+                    if skey:
+                        gw.pool.sticky.unbind(skey, acc.name)   # 失败解绑
+                else:
+                    # upstream hiccup (502/504/500) — do NOT punish the account
+                    gw.pool.report_failure(acc, status, reason, model=model)
+                    gw.log(f"[call] {acc.name} {model} http={status} → 上游异常，换账号重试"
+                           f"（不冷却该账号）")
+                if status in self.FATAL_REQUEST:        # not an account problem
+                    break
+            return last
+
+        # 长任务（输出上限大）→ chunked + 保活，绕开 Cloudflare 60~100s 504
+        min_tok = int(gw.cfg.get("keepalive_min_tokens") or 1500)
+        if int(req.get("max_tokens") or 0) >= min_tok:
+            self._chunked_open()
+            try:
+                res = self._run_with_keepalive(core)
+            except Exception as exc:                    # noqa: BLE001
+                res = (502, json.dumps({"error": {
+                    "message": str(exc), "type": "upstream_error", "code": 502}
+                }).encode("utf-8"))
+            if not res:
+                return                                  # 客户端已断开
+            status, data = res
+            if not data:
+                data = json.dumps({"error": {
+                    "message": "所有账号都失败了 / all accounts failed",
+                    "type": "upstream_error", "code": 502}}).encode("utf-8")
+            self._chunk_write(data)
+            self._chunk_close()
+            return
+
+        # 短请求：走原路径，保留精确 HTTP 状态码
+        status, data = core()
         try:
             return self._json(status or 502, json.loads(data.decode("utf-8")))
         except Exception:                               # noqa: BLE001

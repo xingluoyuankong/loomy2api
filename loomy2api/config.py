@@ -49,6 +49,9 @@ DEFAULTS: Dict[str, Any] = {
     "accounts_file": "accounts.json",
     "strategy": "weighted",       # weighted(三因子加权随机) | balance | round_robin | lru
     "max_retries": 2,             # extra accounts tried on auth/quota errors
+    # 非流式请求 max_tokens ≥ 此值 → 启用 chunked 保活（每 15s 写一个
+    # JSON 合法前导空白），绕开 Cloudflare 免费版 60~100s 的 504。
+    "keepalive_min_tokens": 1500,
     "cooldown_seconds": 300,      # 兜底冷却（未分类错误）
     "session_renew_before_days": 3,
     "quota_refresh_minutes": 30,
