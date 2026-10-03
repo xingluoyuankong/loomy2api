@@ -29,7 +29,14 @@ function toast(msg, kind) {
 
 async function api(path, opts) {
   const o = Object.assign({ headers: {} }, opts || {});
-  if (KEY) o.headers['Authorization'] = 'Bearer ' + KEY;
+  if (KEY) {
+    // 公网域名下 Authorization 头被 nginx Basic Auth 占用，Bearer 会被覆盖
+    // → 网关的 _presented_key 同时认 x-api-key，用它避开冲突（本地/隧道同样兼容）
+    o.headers['x-api-key'] = KEY;
+    if (!location.hostname.startsWith('loomy.')) {
+      o.headers['Authorization'] = 'Bearer ' + KEY;
+    }
+  }
   if (o.body) o.headers['Content-Type'] = 'application/json';
   const res = await fetch(path, o);
   let data = null;
