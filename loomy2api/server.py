@@ -212,13 +212,14 @@ class Handler(BaseHTTPRequestHandler):
     def _chunked_open(self) -> None:
         """开一个 chunked 响应（不带 Content-Length，可边算边发）。
 
-        Content-Type 故意用 ``text/event-stream``：实测 Cloudflare 只对
-        SSE 类型放行长连接，``application/json`` 即使每 15s 写保活字节，
-        仍会在 ~60s 被掐断（504 / 连接关闭）。body 本身仍是合法 JSON，
-        客户端 ``response.json()`` / ``json.loads()`` 不受影响。
+        body 仍是合法 JSON（保活写的是 RFC 8259 允许的前导空白）。
+        实测：走 Cloudflare 代理时非流式响应有 ~60s 硬限制（三次实测
+        均在 62s 断连），换成 SSE Content-Type 也一样 —— 那是 CF 的
+        限制，保活解决不了；但在**不走 CF** 的入口（IP 直连）上，保活
+        能正常撑住长任务。
         """
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Transfer-Encoding", "chunked")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
