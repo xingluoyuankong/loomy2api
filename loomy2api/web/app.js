@@ -293,7 +293,8 @@ async function act(kind, name, value) {
 /* ------------------------------------------- 添加账号向导 */
 
 let WX_STATE = null;      // 微信扫码会话 state
-let LAST_PRICING = {};
+let LAST_PRICING = {};    // 各模型实测单价（来自上游流水聚合）
+let LAST_RECORDS_TOTAL = 0; // 上游流水总条数（分页抓取后的权威值）
 let SMS_STATE = null;     // 短信会话 state
 let SMS_PHONE = '';
 let SMS_MSGID = '';
@@ -681,6 +682,12 @@ async function loadPoints(refresh) {
     const pricing = {};
     data.accounts.forEach((a) => Object.assign(pricing, a.model_pricing || {}));
     LAST_PRICING = pricing;
+    LAST_RECORDS_TOTAL = (data.accounts || []).reduce(
+      (s, a) => s + (a.records_total || 0), 0) || LAST_RECORDS_TOTAL;
+    const recHead = document.querySelector('#view-points section:last-of-type h3 small');
+    if (recHead && LAST_RECORDS_TOTAL) {
+      recHead.textContent = 'records · 上游共 ' + LAST_RECORDS_TOTAL + ' 条，显示最新 ' + Math.min(recs.length, 60) + ' 条';
+    }
   } catch (e) { maybeShowLogin(e); toast('读取积分失败：' + e.message, 'err'); }
 }
 
@@ -878,8 +885,23 @@ function showPgResult(msg, finish, usage, ms, streamed) {
 
 async function loadModels() {
   try {
+    // 各模型实测单价来自「积分构成」的流水聚合（LAST_PRICING）。
+    // 若用户直接进入本页（没先访问积分页），LAST_PRICING 是空的 ——
+    // 必须先拉一次流水，否则表格全部显示「暂无流水」。
+    if (!Object.keys(LAST_PRICING).length) {
+      try {
+        const pdata = await api('/api/panel/points?refresh=1');
+        const pricing = {};
+        (pdata.accounts || []).forEach(
+          (a) => Object.assign(pricing, a.model_pricing || {}));
+        LAST_PRICING = pricing;
+        LAST_RECORDS_TOTAL = (pdata.accounts || []).reduce(
+          (s, a) => s + (a.records_total || (a.records || []).length), 0);
+      } catch (e2) { /* 拉不到就按原样显示「暂无流水」 */ }
+    }
     const data = await api('/api/panel/models');
-    $('mdCount').textContent = data.models.length + ' 个 · 默认 ' + data.default_model;
+    $('mdCount').textContent = data.models.length + ' 个 · 默认 ' + data.default_model
+      + (LAST_RECORDS_TOTAL ? ' · 上游流水 ' + LAST_RECORDS_TOTAL + ' 条' : '');
     const sel = $('pgModel');
     if (sel) {
       const prev = sel.value;

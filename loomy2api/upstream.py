@@ -139,7 +139,8 @@ class ModelGateway:
             "available": data.get("availableBalance"),
         }
 
-    def points_breakdown(self, session: str, proxy: Optional[str] = None) -> Dict[str, Any]:
+    def points_breakdown(self, session: str, proxy: Optional[str] = None,
+                         max_pages: int = 10) -> Dict[str, Any]:
         """积分构成：额度分桶 + 最近流水 + 各模型实测单价。
 
         上游 ``points/records`` 的真实字段（实测）::
@@ -150,16 +151,36 @@ class ModelGateway:
 
         ``modelName + pointsActual`` 正好能统计每个模型的**实际积分单价**，
         比 multiplier 档位更贴近用户账单。
+
+        注意：上游把 ``page_size`` **强制钳到 20**（实测传 100/500 都只回 20），
+        所以必须老老实实翻页，否则只能看到最新 20 条 —— 默认模型一直被
+        面板轮询刷屏，会把其他模型的扣费记录全部挤出第一页，前端就全显示
+        「暂无流水」。
         """
-        payload = self.points_records(session, page_size=100, proxy=proxy)
-        data = payload.get("data") or {}
-        records = data.get("list") or data.get("records") or data.get("items") or []
         out_records: List[Dict[str, Any]] = []
         by_model: Dict[str, List[int]] = {}
-        if isinstance(records, list):
-            for item in records[:100]:
+        seen: set = set()
+        total: Any = None
+        first_data: Dict[str, Any] = {}
+        for page_no in range(1, max_pages + 1):
+            payload = self.points_records(session, page_size=20,
+                                          page_no=page_no, proxy=proxy)
+            data = payload.get("data") or {}
+            if page_no == 1:
+                first_data = data
+                total = data.get("total")
+            records = (data.get("list") or data.get("records")
+                       or data.get("items")) or []
+            for item in records:
                 if not isinstance(item, dict):
                     continue
+                lid = item.get("ledgerId")
+                key = lid if lid is not None else (
+                    item.get("createdAt"), item.get("modelName"),
+                    item.get("pointsActual"))
+                if key in seen:                      # 翻页期间的重复条目
+                    continue
+                seen.add(key)
                 out_records.append({
                     "direction": item.get("direction") or "",
                     "source": item.get("consumeSource") or "",
@@ -172,11 +193,17 @@ class ModelGateway:
                 if item.get("direction") == "debit" and item.get("modelName"):
                     by_model.setdefault(item["modelName"], []).append(
                         item.get("pointsActual") or 0)
+            # 终止：整页读完 / 已抓完全部（total 为上游权威条数）
+            if len(records) < 20:
+                break
+            if isinstance(total, int) and len(out_records) >= total:
+                break
         pricing = {
             m: {"calls": len(v), "min": min(v), "max": max(v),
                 "avg": round(sum(v) / len(v), 2)}
             for m, v in sorted(by_model.items())
         }
+        data = first_data
         return {
             "balance": data.get("balance"),
             "daily_balance": data.get("dailyBalance"),
@@ -186,6 +213,7 @@ class ModelGateway:
             "daily_quota": data.get("dailyQuota"),
             "daily_consumed": data.get("dailyConsumed"),
             "records": out_records,
+            "records_total": total,
             "model_pricing": pricing,
         }
 
