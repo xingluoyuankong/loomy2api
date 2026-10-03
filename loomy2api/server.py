@@ -311,6 +311,10 @@ class Handler(BaseHTTPRequestHandler):
         keys = self.gateway.cfg.api_keys
         if not keys:
             return True
+        # 取 key 的自助端点豁免网关 key 校验（否则鸡生蛋）；
+        # 它自身的安全由反代 Basic Auth + X-Panel-Auth 头校验兜底
+        if self.path.split("?", 1)[0] == "/api/panel/apikey":
+            return True
         token, source = self._presented_key()
         token = token.strip().strip('"').strip("'")
         if token and any(_secret_equal(token, k) for k in keys):
