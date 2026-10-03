@@ -336,7 +336,7 @@ class Panel:
 
     def logs(self, lines: int = 200) -> Dict[str, Any]:
         path = self.gw.log.path
-        lines = max(10, min(int(lines or 200), 2000))
+        lines = max(10, min(int(lines or 200), 5000))
         try:
             content = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:

@@ -71,23 +71,94 @@ def _security_headers(cfg) -> Dict[str, str]:
 
 
 class Logger:
-    """Timestamped file+console logger (never raises)."""
+    """Timestamped file+console logger (never raises).
+
+    三件事（都是排障时最缺的）:
+
+    * **级别** —— ``[INFO]`` / ``[WARN]`` / ``[ERROR]``，面板可按级别过滤。
+      兼容历史写在消息里的 ``[warn]`` / ``[error]`` 前缀：自动升级为级别
+      并剥掉前缀，不重复显示。
+    * **请求 ID** —— thread-local 上下文，一次请求的所有日志串在同一个
+      ``[req:xxxxxxxx]`` 下；错误响应里回传同一个 ID，日志能对上号。
+    * **按大小轮转** —— 默认 20MB，留 3 份历史，避免日志文件把盘撑满。
+    """
 
     def __init__(self, log_dir: Path, name: str = "gateway.log",
-                 console: bool = True):
+                 console: bool = True, max_bytes: int = 20 * 1024 * 1024,
+                 backups: int = 3):
         self.path = Path(log_dir) / name
         self.console = console
+        self.max_bytes = max_bytes
+        self.backups = backups
         self._lock = threading.Lock()
+        self._ctx = threading.local()
 
-    def __call__(self, message: str, *, console: Optional[bool] = None) -> None:
-        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    # -- 请求上下文（thread-local）------------------------------------
+    def bind(self, **kw) -> None:
+        for k, v in kw.items():
+            setattr(self._ctx, k, v)
+
+    def unbind(self, *names) -> None:
+        for n in names:
+            try:
+                delattr(self._ctx, n)
+            except AttributeError:
+                pass
+
+    # -- 级别便捷方法 -------------------------------------------------
+    def info(self, message: str) -> None:
+        self(message, level="INFO")
+
+    def warn(self, message: str) -> None:
+        self(message, level="WARN")
+
+    def error(self, message: str) -> None:
+        self(message, level="ERROR")
+
+    def __call__(self, message: str, *, level: str = "INFO",
+                 console: Optional[bool] = None) -> None:
+        # 历史消息里的级别前缀 → 升级为真正的级别
+        for prefix, lv in (("[warn]", "WARN"), ("[error]", "ERROR"),
+                           ("[debug]", "DEBUG")):
+            if message.startswith(prefix):
+                level = lv
+                message = message[len(prefix):].lstrip()
+                break
+        rid = getattr(self._ctx, "request_id", None)
+        head = "[%s]" % time.strftime("%Y-%m-%d %H:%M:%S")
+        if rid:
+            head += " [req:%s]" % rid
+        line = "%s [%s] %s" % (head, level, message)
         if self.console if console is None else console:
             print(line, flush=True)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
+                self._rotate_if_needed()
                 with self.path.open("a", encoding="utf-8") as fh:
                     fh.write(line + "\n")
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def _rotate_if_needed(self) -> None:
+        """超 max_bytes 就轮转：当前 → .1，.1 → .2 …… 超出 backups 的丢弃。"""
+        try:
+            if not self.path.exists():
+                return
+            if self.path.stat().st_size < self.max_bytes:
+                return
+            for i in range(self.backups, 0, -1):
+                src = self.path.with_name(self.path.name + ".%d" % i)
+                if i >= self.backups:
+                    try:
+                        src.unlink()
+                    except OSError:
+                        pass
+                    continue
+                dst = self.path.with_name(self.path.name + ".%d" % (i + 1))
+                if src.exists():
+                    src.rename(dst)
+            self.path.rename(self.path.with_name(self.path.name + ".1"))
         except Exception:                               # noqa: BLE001
             pass
 
@@ -205,7 +276,11 @@ class Handler(BaseHTTPRequestHandler):
         # reject before reading the payload (e.g. a 401 from the API-key gate).
         self._drain()
         self.close_connection = True
-        self._json(status, {"error": {"message": message, "type": kind, "code": status}})
+        payload: Dict[str, Any] = {"message": message, "type": kind, "code": status}
+        rid = getattr(self, "_req_id", None)
+        if rid:
+            payload["request_id"] = rid
+        self._json(status, {"error": payload})
 
     # -- chunked 保活：防 Cloudflare 60~100s 504 -------------------------
 
@@ -485,6 +560,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):                                # noqa: N802
         self.do_GET()
+
+    def handle_one_request(self):
+        """每个请求进来都绑一个 8 位 request_id。
+
+        日志里会出现 ``[req:xxxxxxxx]``，错误响应里回传同一个 ID ——
+        客户端贴过来的报错能直接对上网关日志里那几行。
+        """
+        rid = uuid.uuid4().hex[:8]
+        self._req_id = rid
+        try:
+            self.gateway.log.bind(request_id=rid)
+        except Exception:                               # noqa: BLE001
+            pass
+        try:
+            super().handle_one_request()
+        finally:
+            try:
+                self.gateway.log.unbind("request_id")
+            except Exception:                           # noqa: BLE001
+                pass
 
     def do_GET(self):                                 # noqa: N802
         path = self._path()

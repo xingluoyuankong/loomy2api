@@ -1060,12 +1060,39 @@ async function saveConfig() {
 
 /* --------------------------------------------------------- 运行日志 */
 
+/** 日志行 → {level, text, raw}（兼容没有级别前缀的历史行） */
+function parseLogLine(raw) {
+  const m = /^(\[[^\]]+\])\s*(?:\[req:([^\]]+)\]\s*)?(?:\[(DEBUG|INFO|WARN|ERROR)\]\s*)?([\s\S]*)$/.exec(raw);
+  if (!m) return { level: 'INFO', rid: '', text: raw, raw };
+  return { level: m[3] || 'INFO', rid: m[2] || '', text: m[4] || '', raw };
+}
+
+const LOG_RANK = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+
 async function loadLog() {
   try {
-    const res = await api('/api/panel/logs?lines=250');
+    const res = await api('/api/panel/logs?lines=500');
     $('logPath').textContent = res.path;
     const box = $('log');
-    box.textContent = res.lines.join('\n');
+    const minRank = $('logLevel').value ? (LOG_RANK[$('logLevel').value] ?? 0) : -1;
+    const kw = ($('logSearch').value || '').trim().toLowerCase();
+    const rows = (res.lines || []).map(parseLogLine);
+    const shown = rows.filter((r) => {
+      if (LOG_RANK[r.level] < minRank) return false;
+      if (kw && r.raw.toLowerCase().indexOf(kw) < 0) return false;
+      return true;
+    });
+    // 级别着色：ERROR 红 / WARN 橙 / INFO 常规
+    box.innerHTML = shown.map((r) => {
+      const cls = r.level === 'ERROR' ? 'log-err'
+        : (r.level === 'WARN' ? 'log-warn' : '');
+      const ridTag = r.rid ? '<span class="log-rid">req:' + esc(r.rid) + '</span> ' : '';
+      return '<div class="log-line ' + cls + '">' + ridTag + esc(r.text) + '</div>';
+    }).join('') || '<div class="empty">没有匹配的日志</div>';
+    const errs = rows.filter((r) => r.level === 'ERROR').length;
+    const warns = rows.filter((r) => r.level === 'WARN').length;
+    $('logStat').textContent = '共 ' + rows.length + ' 行 · ERROR ' + errs + ' · WARN ' + warns
+      + (shown.length !== rows.length ? ' · 筛出 ' + shown.length : '');
     box.scrollTop = box.scrollHeight;
   } catch (e) { toast('读取日志失败：' + e.message, 'err'); }
 }
@@ -1166,6 +1193,9 @@ async function init() {
   $('cfgLoad').onclick = loadConfig;
   $('cfgSave').onclick = saveConfig;
   $('logLoad').onclick = loadLog;
+  $('logLevel').onchange = loadLog;
+  $('logSearch').addEventListener('input', () => loadLog());
+  $('logClearSearch').onclick = () => { $('logSearch').value = ''; loadLog(); };
 
   await bootstrapKey();
   renderKeyCard();
