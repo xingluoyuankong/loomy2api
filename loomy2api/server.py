@@ -280,6 +280,14 @@ class Handler(BaseHTTPRequestHandler):
         rid = getattr(self, "_req_id", None)
         if rid:
             payload["request_id"] = rid
+        # 被拒的请求也要留痕：之前只有响应里有，日志里查不到，
+        # 排障时看不到「谁在打、为什么被拒」。带 req id，能对上号。
+        try:
+            self.gateway.log(
+                f"{self.command} {self._path()} → {status} {message}",
+                level=("ERROR" if status >= 500 else "WARN"))
+        except Exception:                               # noqa: BLE001
+            pass
         self._json(status, {"error": payload})
 
     # -- chunked 保活：防 Cloudflare 60~100s 504 -------------------------
