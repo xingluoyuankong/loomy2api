@@ -339,11 +339,15 @@ class Handler(BaseHTTPRequestHandler):
 
     _login_fails: Dict[str, List[float]] = {}
 
-    def _panel_login(self) -> None:
-        """面板密码登录：成功返回 api_key（即面板管理令牌）。带简单防爆破。"""
+    def _panel_login(self, payload: Dict[str, Any]) -> None:
+        """面板密码登录：成功返回 api_key（即面板管理令牌）。带简单防爆破。
+
+        ``payload`` 由 ``_panel_api`` 解析后传入——这里**不能**再调
+        ``_read_json()``：``_body_read`` 标志会让第二次读拿到空 body，
+        密码恒为空、永远「密码错误」（实测踩过）。
+        """
         import time as _t
-        req = self._read_json()
-        pw = str(req.get("password") or "")
+        pw = str((payload or {}).get("password") or "")
         panel_pw = str(self.gateway.cfg.get("panel_password") or "")
         ip = self.client_address[0]
         now = _t.time()
@@ -555,7 +559,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/login/wechat/bind/submit": panel.login_wechat_bind_submit,
         }
         if path == "/api/panel/login":
-            return self._panel_login()
+            return self._panel_login(payload)
         handler = handlers.get(path)
         if handler is None:
             return self._error(404, f"未知面板接口 / unknown panel endpoint: {path}")
