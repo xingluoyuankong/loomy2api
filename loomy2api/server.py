@@ -838,6 +838,7 @@ class Handler(BaseHTTPRequestHandler):
             finish = ""
             usage: Dict[str, Any] = {}
             rid = ""
+            model_out = ""
             created = int(time.time())
             buffer = b""
             try:
@@ -862,6 +863,10 @@ class Handler(BaseHTTPRequestHandler):
                             rid = j["id"]
                         if j.get("created"):
                             created = j["created"]
+                        if j.get("model"):
+                            # 上游对不认识的模型会静默回落 —— 以回包为准，
+                            # 否则客户端/面板会误以为用的是请求里那个模型
+                            model_out = j["model"]
                         if j.get("usage"):
                             usage = j["usage"]
                         ch = (j.get("choices") or [{}])[0]
@@ -902,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
                     msg["content"] = None
             obj = {"id": rid or ("chatcmpl-" + uuid.uuid4().hex[:12]),
                    "object": "chat.completion", "created": created,
-                   "model": model,
+                   "model": model_out or model,
                    "choices": [{"index": 0, "message": msg, "logprobs": None,
                                 "finish_reason": finish or "stop"}],
                    "usage": usage}
@@ -1122,6 +1127,13 @@ class Handler(BaseHTTPRequestHandler):
                    f"ttfb={ttfb:.2f}s stream")
         except (BrokenPipeError, ConnectionResetError):
             gw.log(f"[call] {acc.name} {model} client disconnected")
+        except Exception as exc:                        # noqa: BLE001
+            # 上游断流 / 读超时等：也要记账，否则失败请求在用量台账里
+            # 凭空消失，排障时看不到这段失败
+            gw.log(f"[call] {acc.name} {model} stream 异常：{exc}")
+            gw.usage.record(account=acc.name, model=model, status=0,
+                            latency=time.time() - started, kind="chat",
+                            error=str(exc), stream=True, proxy=acc.proxy)
         finally:
             gw.pool.release(acc)
             try:
@@ -1334,6 +1346,11 @@ class Handler(BaseHTTPRequestHandler):
                    f"{_rate(translator.usage, elapsed)} ttfb={ttfb:.2f}s stream")
         except (BrokenPipeError, ConnectionResetError):
             gw.log(f"[messages] {acc.name} {model} client disconnected")
+        except Exception as exc:                        # noqa: BLE001
+            gw.log(f"[messages] {acc.name} {model} stream 异常：{exc}")
+            gw.usage.record(account=acc.name, model=model, status=0,
+                            latency=time.time() - started, kind="messages",
+                            error=str(exc), stream=True, proxy=acc.proxy)
         finally:
             gw.pool.release(acc)
             try:
