@@ -308,22 +308,64 @@ class Handler(BaseHTTPRequestHandler):
         return f"{value[:8]}…{value[-4:]}(len={len(value)})"
 
     def _authorized(self) -> bool:
+        path = self.path.split("?", 1)[0]
         keys = self.gateway.cfg.api_keys
-        if not keys:
+        panel_pw = str(self.gateway.cfg.get("panel_password") or "")
+        # 登录端点自身豁免（它就是拿凭证的地方）
+        if path == "/api/panel/login":
             return True
-        # 取 key 的自助端点豁免网关 key 校验（否则鸡生蛋）；
-        # 它自身的安全由反代 Basic Auth + X-Panel-Auth 头校验兜底
-        if self.path.split("?", 1)[0] == "/api/panel/apikey":
+        if not keys and not panel_pw:
             return True
         token, source = self._presented_key()
         token = token.strip().strip('"').strip("'")
         if token and any(_secret_equal(token, k) for k in keys):
             return True
+        # 面板路径：面板密码（登录成功后前端持有的管理令牌）也可作为凭证
+        if path.startswith("/api/panel/") and panel_pw:
+            if _secret_equal(token, panel_pw):
+                return True
+        if path.startswith("/api/panel/"):
+            self.gateway.log(f"[auth] 面板拒绝 {self.command} {self.path}")
+            self._error(401, "请先登录面板 / panel login required",
+                        "panel_auth_required")
+            return False
         # never log the secret itself — just enough to see what arrived
         self.gateway.log(f"[auth] 拒绝 {self.command} {self.path} ← {source} "
                          f"token={self._mask(token)}")
         self._error(401, "无效的 API Key / invalid API key", "authentication_error")
         return False
+
+    # --------------------------------------------- 面板登录（密码 → api key）
+
+    _login_fails: Dict[str, List[float]] = {}
+
+    def _panel_login(self) -> None:
+        """面板密码登录：成功返回 api_key（即面板管理令牌）。带简单防爆破。"""
+        import time as _t
+        req = self._read_json()
+        pw = str(req.get("password") or "")
+        panel_pw = str(self.gateway.cfg.get("panel_password") or "")
+        ip = self.client_address[0]
+        now = _t.time()
+        # 防爆破：同 IP 10 分钟内最多 8 次失败
+        fails = [t for t in self._login_fails.get(ip, []) if now - t < 600]
+        if len(fails) >= 8:
+            self._error(429, "尝试过多，请 10 分钟后再试", "rate_limited")
+            return
+        if not panel_pw:
+            self._error(404, "未启用面板登录（panel_password 未设置）",
+                        "no_panel_auth")
+            return
+        if not pw or not _secret_equal(pw, panel_pw):
+            fails.append(now)
+            self._login_fails[ip] = fails
+            self.gateway.log(f"[auth] 面板登录失败 {ip}（{len(fails)}/8）")
+            self._error(401, "密码错误", "authentication_error")
+            return
+        self._login_fails.pop(ip, None)
+        keys = self.gateway.cfg.api_keys
+        self._json(200, {"ok": True, "api_key": (keys[0] if keys else ""),
+                         "auth_required": bool(keys)})
 
     # ------------------------------------------------------------ routing
 
@@ -512,6 +554,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/login/wechat/bind/send": panel.login_wechat_bind_send,
             "/api/panel/login/wechat/bind/submit": panel.login_wechat_bind_submit,
         }
+        if path == "/api/panel/login":
+            return self._panel_login()
         handler = handlers.get(path)
         if handler is None:
             return self._error(404, f"未知面板接口 / unknown panel endpoint: {path}")

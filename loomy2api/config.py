@@ -35,6 +35,7 @@ DEFAULTS: Dict[str, Any] = {
 
     # gateway -------------------------------------------------------------
     "api_keys": [],               # [] = no auth; otherwise Bearer / x-api-key
+    "panel_password": "",         # 面板登录密码（空 = 面板不需要登录，仅限内网/隧道）
     "default_model": C.DEFAULT_MODEL,
     "timeout": 1200,
     "request_purpose": "chat.message",
@@ -81,6 +82,7 @@ ENV_MAP = {
     "LOOMY_AK_ID": "access_key_id",
     "LOOMY_AK_SECRET": "access_key_secret",
     "LOOMY_API_KEYS": "api_keys",
+    "LOOMY_PANEL_PASSWORD": "panel_password",
     "LOOMY_DEFAULT_MODEL": "default_model",
     "LOOMY_PROXY": "proxy",
     "LOOMY_ACCOUNTS_FILE": "accounts_file",

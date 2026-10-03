@@ -455,6 +455,23 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
 </div>
 <div class="toasts" id="toasts"></div>
 
+<!-- ============ 面板登录 ============ -->
+<div class="veil" id="loginVeil">
+  <div class="modal" style="max-width:360px">
+    <div class="modal-head"><b>面板登录</b></div>
+    <div class="modal-body">
+      <label>面板密码</label>
+      <input type="password" id="loginPw" placeholder="输入面板密码" style="width:100%"
+             autocomplete="current-password">
+      <div class="hint" id="loginErr" style="margin-top:8px;color:var(--bad);display:none"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="loginBtn" style="width:100%">登 录</button>
+      </div>
+      <div class="hint" style="margin-top:8px">密码在服务端 config.json 的 panel_password，登录后自动换取 API Key。</div>
+    </div>
+  </div>
+</div>
+
 <!-- ============ 添加账号向导 ============ -->
 <div class="veil" id="addVeil">
   <div class="modal">

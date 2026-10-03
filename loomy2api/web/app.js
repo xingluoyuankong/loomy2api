@@ -27,18 +27,39 @@ function toast(msg, kind) {
   setTimeout(() => el.remove(), kind === 'err' ? 9000 : 4200);
 }
 
-// 面板启动：若本地没存 key，向网关自助获取（仅反代认证后的管理员可拿）
-async function bootstrapKey() {
-  if (KEY) return;
+// 面板登录：首次/凭证失效时弹出，密码换 api_key，之后全程 x-api-key
+function showLogin() {
+  $('loginVeil').classList.add('on');
+  setTimeout(() => { try { $('loginPw').focus(); } catch (e) {} }, 50);
+}
+
+async function doLogin() {
+  const pw = $('loginPw').value;
+  const btn = $('loginBtn');
+  btn.disabled = true; btn.textContent = '登录中…';
   try {
-    const r = await fetch('/api/panel/apikey');
-    if (!r.ok) return;
-    const d = await r.json();
-    if (d.api_key) {
-      KEY = d.api_key;
-      localStorage.setItem('loomy2api_key', KEY);
-    }
-  } catch (e) { /* 静默：无反代认证时保持未配置状态 */ }
+    const res = await fetch('/api/panel/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(d.error && d.error.message || ('HTTP ' + res.status));
+    KEY = d.api_key || '';
+    localStorage.setItem('loomy2api_key', KEY);
+    $('loginVeil').classList.remove('on');
+    $('loginPw').value = '';
+    toast('登录成功', 'ok');
+    loadAll();
+  } catch (e) {
+    const box = $('loginErr');
+    box.style.display = 'block';
+    box.textContent = '登录失败：' + e.message;
+  } finally { btn.disabled = false; btn.textContent = '登 录'; }
+}
+
+// api() 收到 panel_auth_required → 弹登录层
+function maybeShowLogin(e) {
+  if (String(e.message || '').includes('登录面板')) showLogin();
 }
 
 async function api(path, opts) {
@@ -58,7 +79,11 @@ async function api(path, opts) {
   if (!res.ok) {
     const raw = data && data.error;
     const msg = (raw && (raw.message || raw)) || ('HTTP ' + res.status);
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    if (res.status === 401 && (raw && raw.code) === 'panel_auth_required') {
+      err.code = 'panel_auth_required';
+    }
+    throw err;
   }
   return data;
 }
@@ -201,7 +226,7 @@ function renderState(state) {
 async function loadState(refresh) {
   try {
     renderState(await api('/api/panel/state' + (refresh ? '?refresh=1' : '')));
-  } catch (e) { toast('读取状态失败：' + e.message, 'err'); }
+  } catch (e) { maybeShowLogin(e); toast('读取状态失败：' + e.message, 'err'); }
 }
 
 async function act(kind, name, value) {
@@ -503,7 +528,7 @@ async function loadUsage() {
   try {
     const data = await api('/api/panel/usage?limit=120');
     renderUsage(data);
-  } catch (e) { toast('读取用量失败：' + e.message, 'err'); }
+  } catch (e) { maybeShowLogin(e); toast('读取用量失败：' + e.message, 'err'); }
   try {
     const upData = await api('/api/panel/usage?limit=1&upstream=1');
     const up = upData.upstream;
@@ -546,7 +571,7 @@ function renderUsage(data) {
         + '<td>' + (e.ttfb === null || e.ttfb === undefined ? '—' : e.ttfb.toFixed(2) + 's') + '</td>'
         + '</tr>').join('')
       : '<tr><td colspan="8" class="empty">还没有请求记录</td></tr>';
-  } catch (e) { toast('读取用量失败：' + e.message, 'err'); }
+  } catch (e) { maybeShowLogin(e); toast('读取用量失败：' + e.message, 'err'); }
 }
 
 /* --------------------------------------------------------- 积分构成 */
@@ -606,7 +631,7 @@ async function loadPoints(refresh) {
     const pricing = {};
     data.accounts.forEach((a) => Object.assign(pricing, a.model_pricing || {}));
     LAST_PRICING = pricing;
-  } catch (e) { toast('读取积分失败：' + e.message, 'err'); }
+  } catch (e) { maybeShowLogin(e); toast('读取积分失败：' + e.message, 'err'); }
 }
 
 /* --------------------------------------------------------- 任务中心 */
@@ -652,7 +677,7 @@ async function loadJobs() {
     $('poolRows').innerHTML = rows.map(([k, v]) =>
       '<tr><td class="hint" style="margin:0">' + esc(k)
       + '</td><td><b>' + esc(v) + '</b></td></tr>').join('');
-  } catch (e) { toast('读取任务失败：' + e.message, 'err'); }
+  } catch (e) { maybeShowLogin(e); toast('读取任务失败：' + e.message, 'err'); }
 }
 
 async function doCheckinView() {
@@ -846,7 +871,7 @@ async function loadModels() {
         + '<td>' + (m.is_default ? '<span class="badge b-accent">默认</span>' : '') + '</td>'
         + '</tr>';
     }).join('') : '<tr><td colspan="7" class="empty">上游未返回模型（未登录？）</td></tr>';
-  } catch (e) { toast('读取模型失败：' + e.message, 'err'); }
+  } catch (e) { maybeShowLogin(e); toast('读取模型失败：' + e.message, 'err'); }
 }
 
 /* --------------------------------------------------------- 代理出口 */
@@ -991,6 +1016,8 @@ function init() {
   };
   $('pRefresh').onclick = () => loadPoints(true);
   $('pgRun').onclick = pgRun;
+  $('loginBtn').onclick = doLogin;
+  $('loginPw').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
   $('pCheckin').onclick = doCheckin;
   $('tCheckin').onclick = doCheckinView;
   $('tRedeem').onclick = doRedeem;
