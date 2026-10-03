@@ -120,7 +120,8 @@ async function doLogin() {
     $('loginVeil').classList.remove('on');
     $('loginPw').value = '';
     toast('登录成功', 'ok');
-    loadAll();
+    loadView(VIEW);          // 原为 loadAll() —— 全项目无此定义，登录后
+                             // 会抛 ReferenceError，数据不会刷新
   } catch (e) {
     const box = $('loginErr');
     box.style.display = 'block';
