@@ -33,7 +33,12 @@ let KEY_REVEAL = false;
 function renderKeyCard() {
   const el = $('keyBig'), base = $('keyBaseUrl');
   if (!el) return;
-  if (base) base.textContent = location.origin + '/v1';
+  if (base) {
+    const url = location.origin + '/v1';
+    base.textContent = url;
+    const cp = $('keyCopyUrl');           // 面板经 IP 访问时也复制当前地址
+    if (cp) cp.setAttribute('data-copy', url);
+  }
   if (!KEY) { el.textContent = '— 未获取 —'; el.style.opacity = .55; return; }
   el.style.opacity = 1;
   el.textContent = KEY_REVEAL ? KEY

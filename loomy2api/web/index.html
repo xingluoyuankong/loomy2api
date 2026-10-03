@@ -482,7 +482,14 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span style="font-size:13px;color:var(--ink-3)">Base URL</span>
             <code class="mono" id="keyBaseUrl" style="font-size:16px;font-weight:600">—</code>
-            <button class="icon" data-copy="https://your-domain.example/v1" title="复制 Base URL">⧉</button>
+            <button class="icon" id="keyCopyUrl" data-copy="https://your-domain.example/v1" title="复制 Base URL">⧉</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px">
+            <span style="font-size:13px;color:var(--ink-3)">备用直连</span>
+            <code class="mono" style="font-size:13px">http://your-server-ip/v1</code>
+            <button class="icon" data-copy="http://your-server-ip/v1" title="复制 IP 直连（80 端口 http，无需 DNS）">⧉</button>
+            <code class="mono" style="font-size:13px">https://your-server-ip/v1</code>
+            <button class="icon" data-copy="https://your-server-ip/v1" title="复制 IP 直连（443 https，需忽略证书校验）">⧉</button>
           </div>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">
             <span style="font-size:13px;color:var(--ink-3)">API Key</span>
@@ -493,9 +500,16 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             <button class="primary lg" id="keyCopyBig">⧉ 复制 Key</button>
             <button class="lg" id="keyCopyAll">⧉ 复制整套（URL + Key）</button>
           </div>
-          <div class="hint" style="margin-top:12px;font-size:12px">
-            用法：<code>Authorization: Bearer &lt;API Key&gt;</code>，Base URL 填
-            <code>https://your-domain.example/v1</code>（OpenAI SDK 直接可用）。
+          <div class="note info on" style="margin-top:12px;font-size:12px">
+            <b>⚠ 域名解析不了？</b>域名 <code>your-dns.example</code> 的 DNS 服务器（example-dns.org）在国内<b>间歇性超时</b>，
+            客户端可能报 <code>getaddrinfo ENOTFOUND your-domain.example</code>。三种解法：<br>
+            ① <b>最省事</b>：Base URL 换成 <code>http://your-server-ip/v1</code>（IP 直连，完全不依赖 DNS）；<br>
+            ② <b>客户端只允许 https</b>：换 <code>https://your-server-ip/v1</code> 并勾选「忽略证书校验」；<br>
+            ③ <b>想保留 https 且证书有效</b>：在客户端机器的 hosts 文件加一条
+            <code>203.0.113.10 your-domain.example</code>（Cloudflare IP 可能变动，失效时重新查询）。
+          </div>
+          <div class="hint" style="margin-top:10px;font-size:12px">
+            用法：<code>Authorization: Bearer &lt;API Key&gt;</code>（OpenAI SDK 直接可用）。
             兼容 <code>x-api-key</code> 头与 query 参数 <code>?key=</code>。
           </div>
         </div>
