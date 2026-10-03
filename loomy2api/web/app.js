@@ -51,6 +51,22 @@ async function copyText(text, okMsg) {
     toast(okMsg, 'ok');
   }
 }
+/** 复制并给按钮一个「✓ 已复制」瞬时反馈（1.2s 后还原） */
+async function copyBtnFeedback(btn, text, okMsg) {
+  if (!btn || btn.dataset.busy) return;
+  btn.dataset.busy = '1';
+  const old = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  btn.textContent = '✓ 已复制';
+  setTimeout(() => { btn.textContent = old; delete btn.dataset.busy; }, 1200);
+  toast(okMsg, 'ok');
+}
 
 // 面板登录：首次/凭证失效时弹出，密码换 api_key，之后全程 x-api-key
 function showLogin() {
@@ -348,6 +364,13 @@ function openAdd() {
   const lb = $('wxLink');
   if (lb) { lb.disabled = false; lb.textContent = '生成登录链接'; }
   $('wxWatch').innerHTML = '';
+  // 复用向导时重置上次成功/失败留下的按钮状态（否则会卡在「登录中…」且永久禁用）
+  const sSub = $('sSubmit');
+  if (sSub) { sSub.disabled = false; sSub.textContent = '用验证码登录'; }
+  const sPass = $('sPassLogin');
+  if (sPass) { sPass.disabled = false; sPass.textContent = '用密码登录'; }
+  const sSend = $('sSend');
+  if (sSend) { sSend.disabled = false; sSend.textContent = '发送验证码'; }
   ['s-name', 's-phone', 's-code', 's-pass'].forEach((id) => { const e = $(id); if (e) e.value = ''; });
   setAddPane('wechat');
   $('addVeil').classList.add('on');
@@ -787,10 +810,14 @@ async function pgRun() {
       showPgResult(msg, ch.finish_reason, u, performance.now() - t0, false);
     } else {
       // 流式：手动读 SSE，增量渲染 content / reasoning / tool_calls
-      const o = { headers: Object.assign({}, KEY ? { Authorization: 'Bearer ' + KEY } : {},
-                 { 'Content-Type': 'application/json' }) };
+      // 头部规则与 api() 一致：公网域名下用 x-api-key（Bearer 会被 nginx Basic Auth 覆盖）
+      const sHeaders = Object.assign({}, KEY ? { 'x-api-key': KEY } : {},
+        { 'Content-Type': 'application/json' });
+      if (KEY && !location.hostname.startsWith('loomy.')) {
+        sHeaders['Authorization'] = 'Bearer ' + KEY;
+      }
       const res = await fetch('/v1/chat/completions', {
-        method: 'POST', headers: o.headers, body: JSON.stringify(payload) });
+        method: 'POST', headers: sHeaders, body: JSON.stringify(payload) });
       if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -1052,7 +1079,12 @@ async function init() {
   $('keyEye').onclick = () => { KEY_REVEAL = !KEY_REVEAL; renderKeyCard(); };
   $('keyCopyBig').onclick = () => {
     if (!KEY) return toast('当前没有 API Key（先登录）', 'err');
-    copyText(KEY, 'API Key 已复制到剪贴板');
+    copyBtnFeedback($('keyCopyBig'), KEY, 'API Key 已复制到剪贴板');
+  };
+  $('keyCopyAll').onclick = () => {
+    if (!KEY) return toast('当前没有 API Key（先登录）', 'err');
+    copyBtnFeedback($('keyCopyAll'), location.origin + '/v1|' + KEY,
+      '已复制「Base URL|Key」，粘贴后按 | 拆分');
   };
   document.querySelectorAll('[data-copy]').forEach((b) => {
     b.onclick = () => copyText(b.getAttribute('data-copy'), 'Base URL 已复制');
