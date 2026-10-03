@@ -27,6 +27,31 @@ function toast(msg, kind) {
   setTimeout(() => el.remove(), kind === 'err' ? 9000 : 4200);
 }
 
+// ---- 配置页「API 接入」大卡片 ----
+let KEY_REVEAL = false;
+
+function renderKeyCard() {
+  const el = $('keyBig'), base = $('keyBaseUrl');
+  if (!el) return;
+  if (base) base.textContent = location.origin + '/v1';
+  if (!KEY) { el.textContent = '— 未获取 —'; el.style.opacity = .55; return; }
+  el.style.opacity = 1;
+  el.textContent = KEY_REVEAL ? KEY
+    : (KEY.slice(0, 8) + '•'.repeat(Math.max(4, KEY.length - 12)) + KEY.slice(-4));
+}
+
+async function copyText(text, okMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMsg, 'ok');
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+    toast(okMsg, 'ok');
+  }
+}
+
 // 面板登录：首次/凭证失效时弹出，密码换 api_key，之后全程 x-api-key
 function showLogin() {
   $('loginVeil').classList.add('on');
@@ -47,6 +72,7 @@ async function doLogin() {
     KEY = d.api_key || '';
     localStorage.setItem('loomy2api_key', KEY);
     try { $('apiKey').value = KEY; } catch (e) {}
+    renderKeyCard();
     $('loginVeil').classList.remove('on');
     $('loginPw').value = '';
     toast('登录成功', 'ok');
@@ -968,7 +994,7 @@ async function loadLog() {
 
 /* ------------------------------------------------------------- 启动 */
 
-function init() {
+async function init() {
   initTheme();
 
   document.querySelectorAll('.nav li a').forEach((a) => {
@@ -1001,6 +1027,7 @@ function init() {
   };
   $('saveKey').onclick = () => {
     KEY = $('apiKey').value.trim();
+    renderKeyCard();
     localStorage.setItem('loomy2api_key', KEY);
     toast('已保存 API Key', 'ok');
     loadView(VIEW);
@@ -1022,6 +1049,14 @@ function init() {
     const el = $('apiKey');
     el.type = el.type === 'password' ? 'text' : 'password';
   };
+  $('keyEye').onclick = () => { KEY_REVEAL = !KEY_REVEAL; renderKeyCard(); };
+  $('keyCopyBig').onclick = () => {
+    if (!KEY) return toast('当前没有 API Key（先登录）', 'err');
+    copyText(KEY, 'API Key 已复制到剪贴板');
+  };
+  document.querySelectorAll('[data-copy]').forEach((b) => {
+    b.onclick = () => copyText(b.getAttribute('data-copy'), 'Base URL 已复制');
+  });
   $('copyKey').onclick = async () => {
     const v = $('apiKey').value.trim();
     if (!v) return toast('当前没有 API Key', 'err');
@@ -1049,6 +1084,8 @@ function init() {
   $('cfgSave').onclick = saveConfig;
   $('logLoad').onclick = loadLog;
 
+  await bootstrapKey();
+  renderKeyCard();
   const start = (location.hash || '#accounts').slice(1);
   show(TITLES[start] ? start : 'accounts');
 

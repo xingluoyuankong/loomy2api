@@ -429,6 +429,27 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
     <!-- ============ 配置 ============ -->
     <section class="view" id="view-config">
       <section>
+        <h3>API 接入 <small>api access · 复制即用</small></h3>
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:14px">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span style="font-size:13px;color:var(--muted)">Base URL</span>
+            <code class="mono" id="keyBaseUrl" style="font-size:16px;font-weight:600">—</code>
+            <button class="icon" data-copy="https://your-domain.example/v1" title="复制 Base URL">⧉</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">
+            <span style="font-size:13px;color:var(--muted)">API Key</span>
+            <code class="mono" id="keyBig" style="font-size:20px;font-weight:700;letter-spacing:.5px">— 未获取 —</code>
+            <button class="icon" id="keyEye" title="显示/隐藏">👁</button>
+            <button id="keyCopyBig" class="primary" style="padding:8px 18px;font-size:14px">⧉ 复制 Key</button>
+          </div>
+          <div class="hint" style="margin-top:12px;font-size:12px">
+            用法：<code>Authorization: Bearer &lt;API Key&gt;</code>，Base URL 填
+            <code>https://your-domain.example/v1</code>（OpenAI SDK 直接可用）。
+            兼容 <code>x-api-key</code> 头与 query 参数 <code>?key=</code>。
+          </div>
+        </div>
+      </section>
+      <section>
         <h3>在线配置 <small>live config · 保存即热生效</small></h3>
         <div class="row" style="margin-bottom:8px">
           <button id="cfgLoad">读取配置</button>
