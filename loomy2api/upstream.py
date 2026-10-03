@@ -80,11 +80,13 @@ class ModelGateway:
                                 f"{data[:200].decode('utf-8', 'replace')}", status)
         return json.loads(data.decode("utf-8"))
 
-    def points_records(self, session: str, page_size: int = 20,
+    def points_records(self, session: str, page_size: int = 100,
                        page_no: int = 1,
                        proxy: Optional[str] = None) -> Dict[str, Any]:
-        url = self._url(f"points/records?record_type=all&page_no={page_no}"
-                        f"&page_size={page_size}")
+        # 注意：上游只认 **camelCase 的 pageSize**（实测 page_size 被静默忽略，
+        # 回落默认 20；pageSize=100 真回 100 条）。pageNo 同理用 camelCase。
+        url = self._url(f"points/records?record_type=all&pageNo={page_no}"
+                        f"&pageSize={page_size}")
         status, _h, data = http_request(
             url, method="GET", headers=self._headers(session),
             timeout=30, proxy=self._proxy(proxy))
@@ -152,10 +154,11 @@ class ModelGateway:
         ``modelName + pointsActual`` 正好能统计每个模型的**实际积分单价**，
         比 multiplier 档位更贴近用户账单。
 
-        注意：上游把 ``page_size`` **强制钳到 20**（实测传 100/500 都只回 20），
-        所以必须老老实实翻页，否则只能看到最新 20 条 —— 默认模型一直被
-        面板轮询刷屏，会把其他模型的扣费记录全部挤出第一页，前端就全显示
-        「暂无流水」。
+        注意：上游只认 **camelCase 的 pageSize** —— 旧代码传下划线
+        ``page_size`` 被静默忽略、回落默认 20（实测踩坑）。正确传
+        ``pageSize=100`` 一页能拿 100 条，翻页聚合覆盖最近 500 条，
+        否则默认模型一直被面板轮询刷屏，会把其他模型的扣费记录全部
+        挤出窗口，前端就全显示「暂无流水」。
         """
         out_records: List[Dict[str, Any]] = []
         by_model: Dict[str, List[int]] = {}
@@ -163,7 +166,7 @@ class ModelGateway:
         total: Any = None
         first_data: Dict[str, Any] = {}
         for page_no in range(1, max_pages + 1):
-            payload = self.points_records(session, page_size=20,
+            payload = self.points_records(session, page_size=100,
                                           page_no=page_no, proxy=proxy)
             data = payload.get("data") or {}
             if page_no == 1:
@@ -194,7 +197,7 @@ class ModelGateway:
                     by_model.setdefault(item["modelName"], []).append(
                         item.get("pointsActual") or 0)
             # 终止：整页读完 / 已抓完全部（total 为上游权威条数）
-            if len(records) < 20:
+            if len(records) < 100:
                 break
             if isinstance(total, int) and len(out_records) >= total:
                 break
