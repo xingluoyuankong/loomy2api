@@ -786,6 +786,134 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------- chat (core)
 
+    def _chat_stream_to_json(self, req: Dict[str, Any], extra: Dict[str, str],
+                             model: str, skey: Optional[str] = None) -> Tuple[int, bytes]:
+        """非流式长任务 → **用流式调上游** → 聚合回 OpenAI 非流式 JSON。
+
+        实测：上游对「长时间无响应」的非流式请求会在 ~60s 返回 504
+        （8000 tok 任务 62s 即 http=504，日志实锤），但同一个模型的流式
+        调用能跑几分钟（32000 tok / 212s 成功）。所以把非流式长任务转成
+        流式取数，边收 SSE 边聚合，最后拼回非流式格式返回 —— 客户端
+        无感，长任务不再被上游 504 掐断。
+        """
+        gw = self.gateway
+        sreq = dict(req)
+        sreq["stream"] = True
+        tried: list = []
+        last: Tuple[int, bytes] = (0, b"")
+        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+            try:
+                acc = gw.pool.acquire(exclude=tried, model=model,
+                                      session_key_value=skey)
+            except PoolError as exc:
+                gw.log(f"[warn] {exc}")
+                break
+            tried.append(acc.name)
+            started = time.time()
+            conn = resp = None
+            try:
+                conn, resp = gw.models_client.stream(
+                    acc.session, "chat/completions", sreq, extra,
+                    proxy=acc.proxy or None)
+            except Exception as exc:                    # noqa: BLE001
+                gw.pool.release(acc)
+                gw.log(f"[call] {acc.name} {model} 长任务流式连接异常：{exc}")
+                last = (502, str(exc).encode("utf-8"))
+                continue
+            if resp.status != 200:
+                data = resp.read()
+                conn.close()
+                gw.pool.release(acc)
+                last = (resp.status, data)
+                reason = data[:200].decode("utf-8", "replace")
+                gw.usage.record(account=acc.name, model=model, status=resp.status,
+                                latency=time.time() - started, kind="chat",
+                                error=reason, proxy=acc.proxy)
+                gw.pool.report_failure(acc, resp.status, reason, model=model)
+                continue
+
+            content_parts: list = []
+            reason_parts: list = []
+            tools: Dict[int, Dict[str, str]] = {}
+            finish = ""
+            usage: Dict[str, Any] = {}
+            rid = ""
+            created = int(time.time())
+            buffer = b""
+            try:
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == b"[DONE]":
+                            continue
+                        try:
+                            j = json.loads(payload.decode("utf-8"))
+                        except Exception:               # noqa: BLE001
+                            continue
+                        if j.get("id"):
+                            rid = j["id"]
+                        if j.get("created"):
+                            created = j["created"]
+                        if j.get("usage"):
+                            usage = j["usage"]
+                        ch = (j.get("choices") or [{}])[0]
+                        if ch.get("finish_reason"):
+                            finish = ch["finish_reason"]
+                        d = ch.get("delta") or {}
+                        if d.get("content"):
+                            content_parts.append(d["content"])
+                        if d.get("reasoning_content"):
+                            reason_parts.append(d["reasoning_content"])
+                        for tc in (d.get("tool_calls") or []):
+                            idx = tc.get("index", 0)
+                            slot = tools.setdefault(idx, {"name": "", "args": ""})
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                slot["args"] += fn["arguments"]
+            finally:
+                gw.pool.release(acc)
+                try:
+                    conn.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+
+            elapsed = time.time() - started
+            content = "".join(content_parts)
+            reasoning = "".join(reason_parts)
+            msg: Dict[str, Any] = {"role": "assistant", "content": content}
+            if reasoning:
+                msg["reasoning_content"] = reasoning
+            if tools:
+                msg["tool_calls"] = [
+                    {"id": "call_%d" % i, "type": "function",
+                     "function": {"name": t["name"], "arguments": t["args"]}}
+                    for i, t in sorted(tools.items())]
+                if not content:
+                    msg["content"] = None
+            obj = {"id": rid or ("chatcmpl-" + uuid.uuid4().hex[:12]),
+                   "object": "chat.completion", "created": created,
+                   "model": model,
+                   "choices": [{"index": 0, "message": msg, "logprobs": None,
+                                "finish_reason": finish or "stop"}],
+                   "usage": usage}
+            gw.pool.report_success(acc, usage, model=model)
+            gw.usage.record(account=acc.name, model=model, status=200, usage=usage,
+                            latency=elapsed, kind="chat", proxy=acc.proxy)
+            gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s http=200 流式聚合 "
+                   f"{human_usage(usage)}{_rate(usage, elapsed)}")
+            return (200, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+        return last
+
     def _chat(self) -> None:
         gw = self.gateway
         req = self._read_json()
@@ -871,7 +999,10 @@ class Handler(BaseHTTPRequestHandler):
         if int(req.get("max_tokens") or 0) >= min_tok:
             self._chunked_open()
             try:
-                res = self._run_with_keepalive(core)
+                # 长任务：内部转流式取数（上游非流式 ~60s 就 504），
+                # 聚合后仍以非流式 JSON 返回，客户端无感。
+                res = self._run_with_keepalive(
+                    lambda: self._chat_stream_to_json(req, extra, model, skey))
             except Exception as exc:                    # noqa: BLE001
                 res = (502, json.dumps({"error": {
                     "message": str(exc), "type": "upstream_error", "code": 502}
