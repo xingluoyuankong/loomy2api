@@ -27,6 +27,20 @@ function toast(msg, kind) {
   setTimeout(() => el.remove(), kind === 'err' ? 9000 : 4200);
 }
 
+// 面板启动：若本地没存 key，向网关自助获取（仅反代认证后的管理员可拿）
+async function bootstrapKey() {
+  if (KEY) return;
+  try {
+    const r = await fetch('/api/panel/apikey');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.api_key) {
+      KEY = d.api_key;
+      localStorage.setItem('loomy2api_key', KEY);
+    }
+  } catch (e) { /* 静默：无反代认证时保持未配置状态 */ }
+}
+
 async function api(path, opts) {
   const o = Object.assign({ headers: {} }, opts || {});
   if (KEY) {

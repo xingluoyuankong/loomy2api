@@ -382,6 +382,11 @@ class Panel:
         removed = self.gw.usage.clear()
         return {"ok": True, "cleared": removed}
 
+    def apikey_view(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """管理员自助取 key（配合反代 X-Panel-Auth 使用，server 层校验）。"""
+        keys = self.gw.cfg.api_keys
+        return {"ok": True, "api_key": (keys[0] if keys else "")}
+
     def points(self, *, refresh: bool = False) -> Dict[str, Any]:
         """面板「积分构成」页：逐账号的余额/每日/可用 + 流水。"""
         if refresh:

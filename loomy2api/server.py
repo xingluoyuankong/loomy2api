@@ -279,6 +279,10 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qs, urlparse as _urlparse
 
         raw = (self.headers.get("Authorization") or "").strip()
+        if raw.lower().startswith("basic "):
+            # 反代层（nginx auth_basic）的凭证，不是本网关的 key；
+            # 不跳过它会把 Basic 串当 key 去比，导致 x-api-key 永远轮不到
+            raw = ""
         if raw:
             if raw.lower().startswith("bearer "):
                 return raw[7:].strip(), "authorization:bearer"
@@ -363,6 +367,14 @@ class Handler(BaseHTTPRequestHandler):
                             or ["0"])[0] in ("1", "true")
                 return self._json(200, self.gateway.panel.usage(
                     limit=limit, window_hours=window, upstream=upstream))
+            if path == "/api/panel/apikey":
+                # 只给已通过 nginx Basic Auth 的管理员看（反代注入 X-Panel-Auth）
+                if not (self.headers.get("X-Panel-Auth") or "").strip():
+                    return self._error(401, "仅限面板认证来源 / panel auth required",
+                                       "authentication_error")
+                keys = self.gateway.cfg.api_keys
+                return self._json(200, {"ok": True,
+                                        "api_key": (keys[0] if keys else "")})
             if path == "/api/panel/points":
                 from urllib.parse import parse_qs as _pqs, urlparse as _pu
                 refresh = (_pqs(_pu(self.path).query).get("refresh")
@@ -482,6 +494,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/login/start": panel.login_start,
             "/api/panel/login/send": panel.login_send,
             "/api/panel/login/submit": panel.login_submit,
+            "/api/panel/apikey": panel.apikey_view,
             "/api/panel/checkin": panel.checkin,
             "/api/panel/tasks": panel.platform_tasks,
             "/api/panel/redeem": panel.redeem,
