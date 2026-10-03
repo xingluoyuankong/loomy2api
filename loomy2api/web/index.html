@@ -484,12 +484,25 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             <code class="mono" id="keyBaseUrl" style="font-size:16px;font-weight:600">—</code>
             <button class="icon" id="keyCopyUrl" data-copy="https://your-domain.example/v1" title="复制 Base URL">⧉</button>
           </div>
-          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px">
-            <span style="font-size:13px;color:var(--ink-3)">备用直连</span>
-            <code class="mono" style="font-size:13px">http://your-server-ip/v1</code>
-            <button class="icon" data-copy="http://your-server-ip/v1" title="复制 IP 直连（80 端口 http，无需 DNS）">⧉</button>
-            <code class="mono" style="font-size:13px">https://your-server-ip/v1</code>
-            <button class="icon" data-copy="https://your-server-ip/v1" title="复制 IP 直连（443 https，需忽略证书校验）">⧉</button>
+          <div style="margin-top:12px">
+            <span style="font-size:13px;color:var(--ink-3)">备用域名（推荐 · 正式 https 证书）</span>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
+              <code class="mono" style="font-size:14px;font-weight:600">https://loomy.your-server-ip.nip.io/v1</code>
+              <button class="icon" data-copy="https://loomy.your-server-ip.nip.io/v1" title="复制备用域名（主推）">⧉</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
+              <code class="mono" style="font-size:13px">https://your-server-ip.sslip.io/v1</code>
+              <button class="icon" data-copy="https://your-server-ip.sslip.io/v1" title="复制备用域名（更快）">⧉</button>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <span style="font-size:13px;color:var(--ink-3)">IP 直连（兜底 · 不依赖任何 DNS）</span>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
+              <code class="mono" style="font-size:13px">http://your-server-ip/v1</code>
+              <button class="icon" data-copy="http://your-server-ip/v1" title="复制 IP 直连（80 端口 http）">⧉</button>
+              <code class="mono" style="font-size:13px">https://your-server-ip/v1</code>
+              <button class="icon" data-copy="https://your-server-ip/v1" title="复制 IP 直连（443 https，需忽略证书）">⧉</button>
+            </div>
           </div>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">
             <span style="font-size:13px;color:var(--ink-3)">API Key</span>
@@ -501,12 +514,17 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             <button class="lg" id="keyCopyAll">⧉ 复制整套（URL + Key）</button>
           </div>
           <div class="note info on" style="margin-top:12px;font-size:12px">
-            <b>⚠ 域名解析不了？</b>域名 <code>your-dns.example</code> 的 DNS 服务器（example-dns.org）在国内<b>间歇性超时</b>，
-            客户端可能报 <code>getaddrinfo ENOTFOUND your-domain.example</code>。三种解法：<br>
-            ① <b>最省事</b>：Base URL 换成 <code>http://your-server-ip/v1</code>（IP 直连，完全不依赖 DNS）；<br>
-            ② <b>客户端只允许 https</b>：换 <code>https://your-server-ip/v1</code> 并勾选「忽略证书校验」；<br>
-            ③ <b>想保留 https 且证书有效</b>：在客户端机器的 hosts 文件加一条
-            <code>203.0.113.10 your-domain.example</code>（Cloudflare IP 可能变动，失效时重新查询）。
+            <b>⚠ 域名解析不了？</b>主域名的解析链必须经 <code>your-dns.example</code>（DNSHE 免费 DNS，
+            <code>ns.example-dns.org</code>）这一跳，它在国内<b>偶发超时</b> → 客户端报
+            <code>getaddrinfo ENOTFOUND your-domain.example</code>（实测各家 DNS 有丢包）。<br>
+            <b>解法：换用上面的备用域名</b> —— 由 nip.io / sslip.io 的权威 DNS 直接解析到本机，
+            <b>完全绕开 example-dns.org</b>，实测国内 25/25 成功，且<b>证书有效、无需忽略校验</b>：<br>
+            ① <b>主推</b> <code>https://loomy.your-server-ip.nip.io/v1</code>（带 loomy 前缀，像域名）<br>
+            ② <b>更快</b> <code>https://your-server-ip.sslip.io/v1</code>（延迟 ~83ms）<br>
+            ③ 兜底 IP 直连 <code>http://your-server-ip/v1</code>（客户端只认 IP 时用）<br>
+            ④ 想继续用主域名：客户端机器 hosts 加
+            <code>203.0.113.10 your-domain.example</code>，或把 DNS 改成
+            <code>114.114.114.114</code>（实测 15/15 稳定）。
           </div>
           <div class="hint" style="margin-top:10px;font-size:12px">
             用法：<code>Authorization: Bearer &lt;API Key&gt;</code>（OpenAI SDK 直接可用）。
