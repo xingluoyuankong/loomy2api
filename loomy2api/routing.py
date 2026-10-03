@@ -49,6 +49,10 @@ def weight_of(acc, max_available: Optional[int], now: Optional[float] = None,
 
     ``max_available`` 是**全集口径**的最大可用积分（不是子集），这样截断排序和
     抽签权重共享同一基准，两个阶段的权重可比。
+
+    额度因子 = 余额占比 —— **额度多的账号优先被使用**（谁余额足谁扛流量，
+    额度见底的自动沉底）。闲置补偿照旧：刚用过的账号短暂靠后，
+    避免同一个账号被连续打爆，给其他账号留出接流量和续期的窗口。
     """
     now = time.time() if now is None else now
 
@@ -111,10 +115,14 @@ def session_key(payload: Dict[str, Any]) -> Optional[str]:
 
     优先级：
       1. 显式会话标识（``conversation_id`` / ``conversationId`` / ``chat_id`` / ``ChatId``）
-      2. 派生键 ``d-<sha1(system + 首条 user)[:16]>`` —— 通用 OpenAI 客户端不发会话 id，
-         用它也能拿到粘性（原版「粘性会话内容回退」）。
+      2. 派生键 ``d-<sha1(最后一条 user)[:16]>`` —— 用**最后一条** user 消息派生。
 
-    返回 None 表示无法派生（比如空 messages），此时不做粘性，走普通选号。
+    为什么不用「system + 首条 user」（旧逻辑）：
+      通用客户端每轮把完整历史重发，首条消息永远不变 → 键永远相同 →
+      粘性**永久命中**同一个账号，多账号池退化为单账号（实测 779:13 的
+      请求分布就是这么来的）。改成取最后一条 user：多轮对话每轮内容都
+      在变，键跟着变，粘性只对「同一条消息的重试」生效（这正是粘性
+      该干的事），轮换交还给选号策略。
     """
     if not isinstance(payload, dict):
         return None
@@ -124,27 +132,25 @@ def session_key(payload: Dict[str, Any]) -> Optional[str]:
             return f"c-{value}"
 
     messages = payload.get("messages") or []
-    parts: List[str] = []
-    if isinstance(messages, list):
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            role = str(msg.get("role") or "")
-            content = msg.get("content")
-            if isinstance(content, list):          # 多模态 content 数组
-                content = " ".join(
-                    str(p.get("text") or "") for p in content
-                    if isinstance(p, dict)
-                )
-            text = str(content or "")[:2000]
-            if role == "system" and text:
-                parts.append(text)
-            elif role == "user" and text:
-                parts.append(text)
-                break
-    if not parts:
+    if not isinstance(messages, list):
         return None
-    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    last_user = ""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role") or "") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):              # 多模态 content 数组
+            content = " ".join(
+                str(p.get("text") or "") for p in content
+                if isinstance(p, dict)
+            )
+        last_user = str(content or "")[:2000]
+        break
+    if not last_user:
+        return None
+    digest = hashlib.sha1(last_user.encode("utf-8")).hexdigest()[:16]
     return f"d-{digest}"
 
 
