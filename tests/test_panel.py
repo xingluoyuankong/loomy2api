@@ -273,5 +273,36 @@ class TestPanelAuth(PanelHarness, unittest.TestCase):
         self.assertEqual(status, 200)
 
 
+class TestQuotaAutoRefresh(PanelHarness, unittest.TestCase):
+    """面板 state() 轮询 → _refresh_all(only_stale=True) 走轻量刷新 + 秒级节流。"""
+
+    def test_light_refresh_throttled_per_account(self):
+        panel = self.gateway.panel
+        pool = self.gateway.pool
+        acc = pool.get("a")
+        self.assertTrue(acc.session_valid)
+        calls = []
+        orig = pool.refresh_quota_light
+
+        def counting(a):
+            calls.append(a.name)
+            return orig(a)
+
+        pool.refresh_quota_light = counting
+        try:
+            acc.quota_updated_at = int(time.time())  # 刚刷过 → 跳过
+            panel._refresh_all(only_stale=True)
+            self.assertEqual(calls, [])
+            acc.quota_updated_at = int(time.time()) - 3600  # 过期 → 刷
+            panel._refresh_all(only_stale=True)
+            self.assertEqual(calls, ["a"])
+        finally:
+            pool.refresh_quota_light = orig
+
+    def test_state_reports_refresh_cadence(self):
+        _status, payload = self.get_json("/api/panel/state")
+        self.assertEqual(payload["config"]["panel_quota_refresh_seconds"], 60)
+
+
 if __name__ == "__main__":
     unittest.main()

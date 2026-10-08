@@ -310,6 +310,34 @@ class TestQrEndpoints(PanelHarness, unittest.TestCase):
         self.assertEqual(r["qr_url"], "https://open.weixin.qq.com/connect/qrcode/U1")
         self.assertTrue(r["state"])
 
+    def test_qr_start_reuses_link_page_state(self):
+        """登录链接页带 ?state= 进来：必须复用该会话，不能另起新会话。
+
+        回归：之前链接页调 qr/start 不带 state，后端每次新建会话，
+        面板向导轮询的旧 state 永远等不到完成（一直转圈）。
+        """
+        self._patch(qr=lambda **kw: {"uuid": "U2", "qr_url": "q2", "auth_url": "x",
+                                     "page_bytes": 1})
+        # 面板向导先建会话 A（对应 ?state=A 的登录链接）
+        state_a = self._post("/api/panel/login/wechat/qr/start", {})["state"]
+        # 登录链接页带 state=A 再调一次 → 必须还是 A
+        r = self._post("/api/panel/login/wechat/qr/start",
+                       {"name": "", "state": state_a})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["state"], state_a)
+        self.assertIn("state=" + state_a, r["link"])
+        # 会话 A 的 uuid 被更新为新二维码（链接页展示的就是这张）
+        flow = self.gateway.panel.flows.get(state_a)
+        self.assertEqual(flow["uuid"], "U2")
+
+    def test_qr_start_without_state_creates_new(self):
+        self._patch(qr=lambda **kw: {"uuid": "U3", "qr_url": "q3", "auth_url": "x",
+                                     "page_bytes": 1})
+        r = self._post("/api/panel/login/wechat/qr/start",
+                       {"name": "", "state": "expired-or-bogus"})
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["state"] and r["state"] != "expired-or-bogus")
+
     def test_qr_poll_waiting(self):
         self._patch(qr=lambda **kw: {"uuid": "U1", "qr_url": "q", "auth_url": "x",
                                      "page_bytes": 1},

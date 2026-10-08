@@ -57,19 +57,54 @@ class TestUsageLedger(unittest.TestCase):
         led.record(account="b", model="m2", status=200,
                    usage={"prompt_tokens": 1, "completion_tokens": 2, "points_consumed": 1})
         s = led.summary()
-        self.assertEqual(s["totals"]["requests"], 3)
-        self.assertEqual(s["totals"]["ok"], 2)
-        self.assertEqual(s["totals"]["failed"], 1)
-        self.assertEqual(s["totals"]["points"], 6)
-        by_model = {r["name"]: r for r in s["by_model"]}
+        self.assertEqual(set(s["windows"]), {"24h", "today", "3d", "7d", "30d"})
+        self.assertEqual(s["order"], ["24h", "today", "3d", "7d", "30d"])
+        t = s["windows"]["24h"]["totals"]
+        self.assertEqual(t["requests"], 3)
+        self.assertEqual(t["ok"], 2)
+        self.assertEqual(t["failed"], 1)
+        self.assertEqual(t["points"], 6)
+        self.assertEqual(t["total_tokens"], 33)
+        by_model = {r["name"]: r for r in s["windows"]["24h"]["by_model"]}
         self.assertEqual(by_model["m1"]["requests"], 2)
         self.assertEqual(by_model["m2"]["points"], 1)
+
+    def test_windows_filter_by_time(self):
+        led = UsageLedger()
+        led.record(account="now", model="m",
+                   usage={"prompt_tokens": 100, "points_consumed": 10})
+        old = led.record(account="old", model="m",
+                         usage={"prompt_tokens": 50, "points_consumed": 5})
+        old["ts"] -= 10 * 86400  # 10 天前
+        older = led.record(account="older", model="m",
+                           usage={"prompt_tokens": 25, "points_consumed": 2})
+        older["ts"] -= 40 * 86400  # 40 天前
+        w = led.summary()["windows"]
+        self.assertEqual(w["24h"]["totals"]["requests"], 1)
+        self.assertEqual(w["3d"]["totals"]["requests"], 1)
+        self.assertEqual(w["7d"]["totals"]["requests"], 1)
+        self.assertEqual(w["30d"]["totals"]["requests"], 2)   # 10 天前的在 30d 内
+        self.assertEqual(w["30d"]["totals"]["prompt_tokens"], 150)
+        # 当日窗口：刚记的这条一定在自然日内
+        self.assertEqual(w["today"]["totals"]["requests"], 1)
+
+    def test_today_window_uses_local_midnight(self):
+        led = UsageLedger()
+        e = led.record(account="a", model="m",
+                       usage={"prompt_tokens": 7, "points_consumed": 1})
+        lt = time.localtime()
+        midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+        e["ts"] = int(midnight) - 1  # 昨天 23:59:59
+        w = led.summary()["windows"]
+        self.assertEqual(w["today"]["totals"]["requests"], 0)
+        self.assertEqual(w["24h"]["totals"]["requests"], 1)
 
     def test_summary_sorted_by_points(self):
         led = UsageLedger()
         led.record(account="a", model="cheap", usage={"points_consumed": 1})
         led.record(account="a", model="pricey", usage={"points_consumed": 99})
-        self.assertEqual(led.summary()["by_model"][0]["name"], "pricey")
+        self.assertEqual(led.summary()["windows"]["24h"]["by_model"][0]["name"], "pricey")
 
     def test_ring_buffer_caps(self):
         led = UsageLedger(max_entries=10)
@@ -81,7 +116,7 @@ class TestUsageLedger(unittest.TestCase):
         led = UsageLedger()
         led.record(account="a")
         self.assertEqual(led.clear(), 1)
-        self.assertEqual(led.summary()["totals"]["requests"], 0)
+        self.assertEqual(led.summary()["windows"]["24h"]["totals"]["requests"], 0)
 
 
 class TestAccountProxy(PanelHarness, unittest.TestCase):

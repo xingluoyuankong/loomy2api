@@ -16,7 +16,7 @@ Endpoints
 ``POST /api/panel/accounts/renew``    force re-login + quota refresh
 ``POST /api/panel/accounts/identity`` inspect / regenerate the account identity
 ``GET  /api/panel/logs``              tail of the gateway log
-``GET  /api/panel/usage``             请求级用量（聚合 + 最近流水）
+``GET  /api/panel/usage``             请求级用量（五档时间窗口聚合 + 最近流水）
 ``POST /api/panel/usage/clear``       清空用量台账
 ``GET  /api/panel/points``            积分构成（逐账号余额/每日/可用 + 流水）
 ``GET  /api/panel/models``            模型与档位
@@ -165,18 +165,27 @@ class Panel:
             "session" if acc.session else "empty")
         return view
 
-    def _quota_stale(self, acc: Account) -> bool:
-        minutes = float(self.gw.cfg.get("quota_refresh_minutes") or 30)
-        return (time.time() - (acc.quota_updated_at or 0)) > minutes * 60
+    def _quota_stale(self, acc: Account, seconds: float) -> bool:
+        return (time.time() - (acc.quota_updated_at or 0)) > seconds
 
     def _refresh_all(self, only_stale: bool = True) -> None:
+        if only_stale:
+            # 面板高频轮询走轻量刷新：只拉 quota()（余额/每日/可用），
+            # 按 panel_quota_refresh_seconds 节流，避免打爆上游
+            throttle = float(self.gw.cfg.get("panel_quota_refresh_seconds") or 60)
+            refresher = self.pool.refresh_quota_light
+            check_stale = True
+        else:
+            # ?refresh=1 / 积分页：重型全量刷新（含累计消耗/当日扣分）
+            refresher = self.pool.refresh_quota
+            check_stale, throttle = False, 0.0
         for acc in self.pool.accounts:
             if not acc.session_valid:
                 continue
-            if only_stale and not self._quota_stale(acc):
+            if check_stale and not self._quota_stale(acc, throttle):
                 continue
             try:
-                self.pool.refresh_quota(acc)
+                refresher(acc)
             except Exception as exc:                     # noqa: BLE001
                 self.log(f"[panel] 刷新 {acc.name} 额度失败：{exc}")
         self.pool.save()
@@ -214,7 +223,7 @@ class Panel:
                 "breaker_threshold": self.gw.cfg.get("breaker_threshold"),
                 "max_inflight_per_account": self.gw.cfg.get("max_inflight_per_account"),
             },
-            "usage": self.gw.usage.summary(window_hours=24)["totals"],
+            "usage": self.gw.usage.summary()["windows"]["24h"]["totals"],
             "config": {
                 "upstream": self.gw.cfg["upstream"],
                 "strategy": self.gw.cfg.get("strategy"),
@@ -223,6 +232,7 @@ class Panel:
                 "models": len(self.gw.catalogue()),
                 "auth_required": bool(self.gw.cfg.api_keys),
                 "quota_refresh_minutes": self.gw.cfg.get("quota_refresh_minutes"),
+                "panel_quota_refresh_seconds": self.gw.cfg.get("panel_quota_refresh_seconds"),
             },
             "accounts": accounts,
         }
@@ -345,12 +355,11 @@ class Panel:
 
     # ------------------------------------------------- 用量 / 积分 / 模型
 
-    def usage(self, limit: int = 100, window_hours: int = 24,
-              upstream: bool = False) -> Dict[str, Any]:
-        """面板「用量」页：聚合 + 最近流水（可选附上游真实扣费对照）。"""
+    def usage(self, limit: int = 100, upstream: bool = False) -> Dict[str, Any]:
+        """面板「用量」页：五档时间窗口聚合 + 最近流水（可选附上游真实扣费对照）。"""
         out = {
             "ok": True,
-            "summary": self.gw.usage.summary(window_hours=window_hours),
+            "summary": self.gw.usage.summary(),
             "recent": self.gw.usage.recent(limit=limit),
         }
         if upstream:
@@ -788,9 +797,21 @@ class Panel:
 
         这是主链路：面板显示二维码 → 轮询本接口 → 服务端长轮询微信取 code →
         换 session。**用户不需要跳浏览器、也不需要复制任何东西。**
+
+        登录链接页会带 ?state= 进来：此时**复用**那个会话而不是新建——
+        否则面板向导轮询的旧会话永远等不到完成（之前就是这么坏的：
+        链接页扫完显示成功，面板向导却一直转圈）。
         """
-        flow = self.flows.start(name=str(payload.get("name") or "").strip())
-        state = flow["state"]
+        state = str(payload.get("state") or "").strip()
+        flow = self.flows.get(state) if state else None
+        if flow is None:
+            # 会话不在（过期 / 服务重启 / 直接打开链接页）：就地建一个，
+            # 保证二维码一定能出来，不把用户挡回去
+            flow = self.flows.start(name=str(payload.get("name") or "").strip())
+            state = flow["state"]
+        else:
+            self.log(f"[panel] 微信二维码：复用登录链接带来的会话"
+                     f"（state={state[:8]}…）")
         try:
             qr = wechat.fetch_login_qr(state=state)
         except Exception as exc:                        # noqa: BLE001

@@ -261,6 +261,11 @@ class AccountPool:
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         os.replace(tmp, self._file)
+        # 账号文件含 password/session 明文：仅所有者可读写（默认 umask 会写成 644）
+        try:
+            os.chmod(self._file, 0o600)
+        except OSError:
+            pass
 
     def flush(self) -> None:
         """Force a write if a throttled save is pending."""
@@ -374,6 +379,41 @@ class AccountPool:
                  f"session={acc.session[:8]}… 剩余 {(acc.days_left or 0):.1f} 天")
         return acc
 
+    def refresh_quota_light(self, acc: Account) -> Account:
+        """轻量额度刷新：只拉一次上游 quota()（余额/每日/可用）。
+
+        给面板账号页的高频轮询用 —— 上游调用从 3 次降到 1 次。
+        重型的 points_totals / points_first_login 留给后台守护线程的慢周期。
+        失败不抛错、不更新 quota_updated_at（下次轮询会重试）。
+        """
+        if not acc.session:
+            return acc
+        try:
+            quota = self.gateway.quota(acc.session, proxy=acc.proxy or None)
+        except UpstreamError as exc:
+            if exc.status in (401, 403):
+                acc.session, acc.expire_at = "", 0
+                self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
+            else:
+                acc.last_error = f"quota: {exc}"
+                self.log(f"账号 {acc.name} 额度查询失败：{exc}")
+            return acc
+        except Exception as exc:                    # noqa: BLE001
+            acc.last_error = f"quota: {exc}"
+            self.log(f"账号 {acc.name} 额度查询异常（网络？）：{exc}")
+            return acc
+        acc.balance = quota.get("balance")
+        acc.daily_balance = quota.get("daily_balance")
+        acc.available = quota.get("available")
+        acc.quota_updated_at = int(time.time())
+        # 额度恢复 → 解冻硬冷却（额度耗尽型），但不动熔断器
+        if isinstance(acc.available, int) and acc.available > 0 \
+                and acc.cool_kind == "hard":
+            acc.cooldown_until = 0.0
+            acc.cool_kind = ""
+            self.log(f"账号 {acc.name} 额度恢复（可用 {acc.available}）→ 解冻")
+        return acc
+
     def refresh_quota(self, acc: Account) -> Account:
         """Refresh one account's points; never raises.
 
@@ -406,31 +446,8 @@ class AccountPool:
             self.log(f"账号 {acc.name} 当日扣分查询失败：{exc}")
         if daily_consumed is not None:
             acc.daily_consumed = int(daily_consumed)
-        try:
-            quota = self.gateway.quota(acc.session, proxy=acc.proxy or None)
-        except UpstreamError as exc:
-            if exc.status in (401, 403):
-                acc.session, acc.expire_at = "", 0
-                self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
-            else:
-                acc.last_error = f"quota: {exc}"
-                self.log(f"账号 {acc.name} 额度查询失败：{exc}")
-            return acc
-        except Exception as exc:                        # noqa: BLE001
-            acc.last_error = f"quota: {exc}"
-            self.log(f"账号 {acc.name} 额度查询异常（网络？）：{exc}")
-            return acc
-        acc.balance = quota.get("balance")
-        acc.daily_balance = quota.get("daily_balance")
-        acc.available = quota.get("available")
-        acc.quota_updated_at = int(time.time())
-        # 额度恢复 → 解冻硬冷却（额度耗尽型），但不动熔断器
-        if isinstance(acc.available, int) and acc.available > 0 \
-                and acc.cool_kind == "hard":
-            acc.cooldown_until = 0.0
-            acc.cool_kind = ""
-            self.log(f"账号 {acc.name} 额度恢复（可用 {acc.available}）→ 解冻")
-        return acc
+        # 尾巴（quota 拉取 + 解冻）走轻量路径，保持单一份实现
+        return self.refresh_quota_light(acc)
 
     # ------------------------------------------------------------ routing
 

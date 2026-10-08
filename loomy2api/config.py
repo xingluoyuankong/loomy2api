@@ -55,6 +55,13 @@ DEFAULTS: Dict[str, Any] = {
     "cooldown_seconds": 300,      # 兜底冷却（未分类错误）
     "session_renew_before_days": 3,
     "quota_refresh_minutes": 30,
+    # 用量台账内存保留条数（30 天窗口要有数据；当前约 500 条/天，
+    # 20000 条 ≈ 40 天，内存占用约 8MB）
+    "usage_max_entries": 20000,
+    # 面板账号页「可用积分」自动刷新的节流（秒）：前端每 10 秒轮询一次 state，
+    # 每个账号最多每 N 秒真正打一次上游 quota()（轻量，1 次调用）。
+    # 后台守护线程的重型全量刷新仍走 quota_refresh_minutes。
+    "panel_quota_refresh_seconds": 60,
     "sessions_from_client": True, # also honour the desktop client's session
     "client_root": "",            # override the client's data dir (tests)
     # identity_mode: per_account → each account gets its own devid / campus id;
@@ -73,6 +80,7 @@ DEFAULTS: Dict[str, Any] = {
     "sticky_max_entries": 2000,      # 粘性表容量上限
     "max_inflight_per_account": 0,   # 单账号在途上限（0 = 不限）
     "login_flow_ttl_seconds": 600,   # 跳转登录链接有效期（秒）
+    "wechat_browser_timeout": 300,   # 微信扫码浏览器等待超时（秒）
 
     # 网关自身 -------------------------------------------------------------
     "security_headers": True,     # 面板响应加 CSP 等安全头

@@ -616,12 +616,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.gateway.panel.logs(lines))
             if path == "/api/panel/usage":
                 limit = self._query_int("limit", 100)
-                window = self._query_int("hours", 24)
                 from urllib.parse import parse_qs as _pqs, urlparse as _pu
                 upstream = (_pqs(_pu(self.path).query).get("upstream")
                             or ["0"])[0] in ("1", "true")
                 return self._json(200, self.gateway.panel.usage(
-                    limit=limit, window_hours=window, upstream=upstream))
+                    limit=limit, upstream=upstream))
             if path == "/api/panel/apikey":
                 # 只给已通过 nginx Basic Auth 的管理员看（反代注入 X-Panel-Auth）
                 if not (self.headers.get("X-Panel-Auth") or "").strip():
@@ -660,7 +659,7 @@ class Handler(BaseHTTPRequestHandler):
         except PoolError as exc:
             return self._error(503, str(exc), "account_pool_error")
         except Exception as exc:                        # noqa: BLE001
-            self.gateway.log(f"[error] GET {self.path}: {exc}\n{traceback.format_exc()}")
+            self.gateway.log(f"[error] GET {self.path.split('?', 1)[0]}: {exc}\n{traceback.format_exc()}")
             return self._error(502, f"上游调用失败 / upstream failure: {exc}", "upstream_error")
 
     def do_POST(self):                                # noqa: N802
@@ -690,7 +689,7 @@ class Handler(BaseHTTPRequestHandler):
         except PoolError as exc:
             return self._error(400, str(exc), "account_pool_error")
         except Exception as exc:                        # noqa: BLE001
-            self.gateway.log(f"[error] POST {self.path}: {exc}\n{traceback.format_exc()}")
+            self.gateway.log(f"[error] POST {self.path.split('?', 1)[0]}: {exc}\n{traceback.format_exc()}")
             try:
                 return self._error(502, f"上游调用失败 / upstream failure: {exc}",
                                    "upstream_error")

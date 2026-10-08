@@ -19,6 +19,10 @@ class TestSessionKey(unittest.TestCase):
         self.assertEqual(key, "c-abc")
 
     def test_derives_stable_key_from_system_and_first_user(self):
+        # 行为已变更（见 routing.session_key docstring）：用**最后一条** user
+        # 消息派生。旧逻辑（system+首条）导致通用客户端每轮重发完整历史、
+        # 键永远不变、多账号池退化为单账号（实测 779:13 分布）。
+        # 同一条消息重试 → 同一个键（粘性只对重试生效）：
         a = session_key({"messages": [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "hello"},
@@ -26,10 +30,15 @@ class TestSessionKey(unittest.TestCase):
         b = session_key({"messages": [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "hello"},
-            {"role": "user", "content": "DIFFERENT follow-up"}]})
+            {"role": "user", "content": "second turn"}]})
         self.assertTrue(a and a.startswith("d-"))
-        # 同一会话前缀 → 同一个粘性键（后续轮次能落在同一个账号）
         self.assertEqual(a, b)
+        # 不同轮次（最后一条 user 不同）→ 不同的键，轮换交还给选号策略：
+        c = session_key({"messages": [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": "DIFFERENT follow-up"}]})
+        self.assertNotEqual(a, c)
 
     def test_different_conversations_get_different_keys(self):
         a = session_key({"messages": [{"role": "user", "content": "one"}]})

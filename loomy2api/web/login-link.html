@@ -218,7 +218,9 @@ async function boot() {
     return;
   }
   try {
-    const r = await api('/api/panel/login/wechat/qr/start', { name: '' });
+    // 把 URL 里的 state 带上：后端复用这个会话生成二维码，
+    // 面板向导轮询同一个 state 才能收到完成（不带就会另起会话，向导永远等不到）
+    const r = await api('/api/panel/login/wechat/qr/start', { name: '', state: STATE });
     const img = document.createElement('img');
     img.src = r.qr_url; img.alt = '微信扫码';
     const box = $('qrBox');

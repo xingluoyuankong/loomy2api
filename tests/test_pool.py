@@ -209,6 +209,74 @@ class TestSessionLifecycle(unittest.TestCase):
         pool.tick()
         self.assertFalse(pool.get("a").session_valid)
 
+    def test_refresh_quota_light_single_upstream_call(self):
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "session": "s", "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        calls = []
+
+        class FakeGateway:
+            # 注意：故意不定义 points_totals / points_first_login ——
+            # 轻量刷新要是敢调它们，这里直接 AttributeError 炸掉
+            def quota(self, session, proxy=None):
+                calls.append(session)
+                return {"balance": 5, "daily_balance": 6, "available": 11}
+
+        pool.gateway = FakeGateway()
+        acc = pool.get("a")
+        pool.refresh_quota_light(acc)
+        self.assertEqual(calls, ["s"])
+        self.assertEqual((acc.balance, acc.daily_balance, acc.available), (5, 6, 11))
+        self.assertTrue(acc.quota_updated_at > 0)
+
+    def test_refresh_quota_light_failure_keeps_stale(self):
+        from loomy2api.upstream import UpstreamError
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "session": "s", "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeGateway:
+            def quota(self, session, proxy=None):
+                raise UpstreamError("boom", 500)
+
+        pool.gateway = FakeGateway()
+        acc = pool.get("a")
+        pool.refresh_quota_light(acc)
+        # 失败不更新时间戳 → 下次轮询会重试，而不是静默认旧值
+        self.assertEqual(acc.quota_updated_at, 0)
+        self.assertIsNone(acc.available)
+
+    def test_refresh_quota_full_updates_heavy_fields(self):
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "session": "s", "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeGateway:
+            def points_totals(self, session, proxy=None):
+                return {"points_used": 42}
+
+            def points_first_login(self, session, proxy=None):
+                return {"data": {"dailyConsumed": 7}}
+
+            def quota(self, session, proxy=None):
+                return {"balance": 5, "daily_balance": 6, "available": 11}
+
+        pool.gateway = FakeGateway()
+        acc = pool.get("a")
+        pool.refresh_quota(acc)
+        self.assertEqual(acc.points_used, 42)
+        self.assertEqual(acc.daily_consumed, 7)
+        self.assertEqual(acc.available, 11)
+
 
 if __name__ == "__main__":
     unittest.main()

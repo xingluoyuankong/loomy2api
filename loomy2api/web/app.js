@@ -165,6 +165,28 @@ const esc = (s) => String(s === null || s === undefined ? '' : s)
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 const num = (v) => (v === null || v === undefined) ? '—' : v;
 const nf = (v) => (v === null || v === undefined) ? '—' : Number(v).toLocaleString();
+/* Token 字母单位简化：999 -> "999"，1500 -> "1.5K"，2.5M，1.2B */
+const trimNum = (x) => x >= 100 ? String(Math.round(x))
+  : (Math.round(x * 10) / 10).toString().replace(/\.0$/, '');
+const fmtTok = (v) => {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  if (!isFinite(n)) return '—';
+  if (n < 1000) return nf(n);
+  const units = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+  for (let i = 0; i < units.length; i++) {
+    const [u, s] = units[i];
+    if (n >= u) {
+      let x = n / u, suf = s, j = i;
+      // 四舍五入跨单位（如 999999 -> 1000K）则进上一档，显示 1M
+      while (trimNum(x) === '1000' && j > 0) { j--; x = n / units[j][0]; suf = units[j][1]; }
+      return trimNum(x) + suf;
+    }
+  }
+  return nf(n);
+};
+/* token 单元格：简化显示 + 悬停看精确值 */
+const tokCell = (v) => '<span title="' + esc(nf(v)) + '">' + esc(fmtTok(v)) + '</span>';
 const when = (ts) => {
   if (!ts) return '—';
   const d = new Date(ts * 1000);
@@ -176,6 +198,14 @@ const secs = (s) => {
   if (s < 60) return s + 's';
   if (s < 3600) return Math.round(s / 60) + 'm';
   return (s / 3600).toFixed(1) + 'h';
+};
+/* 额度新鲜度：x秒前 / x分钟前更新 */
+const quotaAge = (now, ts) => {
+  if (!ts) return '';
+  const s = Math.max(0, Math.round((now || 0) - ts));
+  if (s < 60) return s + '秒前更新';
+  if (s < 3600) return Math.round(s / 60) + '分钟前更新';
+  return Math.round(s / 3600) + '小时前更新';
 };
 
 /* -------------------------------------------------------------- 主题 */
@@ -261,6 +291,7 @@ function renderState(state) {
     + ' · 429 软冷却 ' + (p.soft_rate_base_seconds || '-') + 's 封顶 ' + (p.soft_rate_max_seconds || '-') + 's'
     + ' · 熔断阈值 ' + (p.breaker_threshold || '-')
     + ' · 模型 ' + c.models + ' 个'
+    + ' · 额度自动刷新 ' + (c.panel_quota_refresh_seconds || 60) + 's'
     + (c.auth_required ? ' · 已开启 Key 校验' : ' · 未设 Key（仅本机）');
 
   $('navPool').textContent = t.usable + '/' + t.accounts + ' 可用';
@@ -282,7 +313,9 @@ function renderState(state) {
       + '<td class="mono">' + esc(a.loginid_masked || '—') + '</td>'
       + '<td>' + badge(a) + '</td>'
       + '<td>' + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</td>'
-      + '<td><b>' + num(a.available) + '</b><div class="hint" style="margin:0">余 ' + num(a.balance) + ' + 日 ' + num(a.daily_balance) + '</div></td>'
+      + '<td><b>' + num(a.available) + '</b><div class="hint" style="margin:0">余 ' + num(a.balance) + ' + 日 ' + num(a.daily_balance) + '</div>'
+      + (a.quota_updated_at ? '<div class="hint" style="margin:0">🕐 ' + esc(quotaAge(state.now, a.quota_updated_at)) + '</div>' : '')
+      + '</td>'
       + '<td>' + px + '</td>'
       + '<td>' + nf(a.requests) + '</td><td>' + nf(a.points_used) + '</td>'
       + '<td class="mono" title="' + esc(id.campus_device_id || '') + '">' + esc(id.devid || '—') + '</td>'
@@ -589,25 +622,41 @@ async function addAccount() {
 
 /* ------------------------------------------------------------- 用量 */
 
+let USAGE_WIN = localStorage.getItem('loomy2api_usage_win') || '24h';
+let USAGE_DATA = null;
+
 function rowsToTable(items) {
   if (!items || !items.length) return '<tr><td colspan="7" class="empty">—</td></tr>';
   return items.map((r) => '<tr>'
     + '<td><b>' + esc(r.name) + '</b></td>'
     + '<td>' + nf(r.requests) + '</td>'
     + '<td><span class="badge b-ok">' + nf(r.ok) + '</span> <span class="badge ' + (r.failed ? 'b-bad' : 'b-off') + '">' + nf(r.failed) + '</span></td>'
-    + '<td>' + nf(r.prompt_tokens) + '</td>'
-    + '<td>' + nf(r.completion_tokens) + '</td>'
+    + '<td>' + tokCell(r.prompt_tokens) + '</td>'
+    + '<td>' + tokCell(r.completion_tokens) + '</td>'
     + '<td><b>' + nf(r.points) + '</b></td>'
     + '<td>' + (r.avg_latency || 0).toFixed(2) + 's</td>'
     + '</tr>').join('');
 }
 
+function bindUsageSeg() {
+  const seg = $('uWinSeg');
+  if (!seg || seg.dataset.bound) return;
+  seg.dataset.bound = '1';
+  seg.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+    USAGE_WIN = b.dataset.win;
+    localStorage.setItem('loomy2api_usage_win', USAGE_WIN);
+    renderUsage();
+  }));
+}
+
 async function loadUsage() {
+  bindUsageSeg();
   // 本地台账与上游对照**分开请求**：上游偶发网络重置（10054/502）时，
   // 本地统计照常显示，对照区单独标灰 —— 不能让整页跟着空。
   try {
     const data = await api('/api/panel/usage?limit=120');
-    renderUsage(data);
+    USAGE_DATA = data;
+    renderUsage();
   } catch (e) { maybeShowLogin(e); toast('读取用量失败：' + e.message, 'err'); }
   try {
     const upData = await api('/api/panel/usage?limit=1&upstream=1');
@@ -624,18 +673,27 @@ async function loadUsage() {
   }
 }
 
-function renderUsage(data) {
+function renderUsage() {
+  const data = USAGE_DATA;
+  if (!data) return;
   try {
-    const s = data.summary, t = s.totals;
+    const s = data.summary;
+    // 兼容旧后端（无 windows 时退回旧字段）
+    const w = (s.windows && (s.windows[USAGE_WIN] || s.windows['24h']))
+      || { label: '全部', totals: s.totals, by_model: s.by_model, by_account: s.by_account };
+    const t = w.totals;
+    document.querySelectorAll('#uWinSeg button').forEach((b) =>
+      b.classList.toggle('on', b.dataset.win === USAGE_WIN));
     $('uReq').textContent = nf(t.requests);
     $('uOk').textContent = nf(t.ok);
     $('uFail').textContent = nf(t.failed);
-    $('uTok').textContent = nf(t.prompt_tokens) + ' / ' + nf(t.completion_tokens);
+    $('uTok').innerHTML = tokCell(t.prompt_tokens) + ' / ' + tokCell(t.completion_tokens);
     $('uPoints').textContent = nf(t.points);
     $('uLat').textContent = (t.avg_latency || 0).toFixed(2) + 's / ' + (t.avg_ttfb || 0).toFixed(2) + 's';
-    $('uSince').textContent = '保留 ' + s.kept + ' 条 · 自 ' + when(s.since) + ' 起统计';
-    $('uModels').innerHTML = rowsToTable(s.by_model);
-    $('uAccounts').innerHTML = rowsToTable(s.by_account);
+    $('uSince').textContent = '时间范围：' + (w.label || USAGE_WIN)
+      + ' · 本地保留 ' + nf(s.kept) + ' 条记录';
+    $('uModels').innerHTML = rowsToTable(w.by_model);
+    $('uAccounts').innerHTML = rowsToTable(w.by_account);
     $('uRecent').innerHTML = (data.recent || []).length
       ? data.recent.map((e) => '<tr>'
         + '<td class="mono">' + when(e.ts) + '</td>'
@@ -645,7 +703,7 @@ function renderUsage(data) {
           ? '<span class="badge b-ok">' + e.status + '</span>'
           : '<span class="badge b-bad" title="' + esc(e.error) + '">' + (e.status || 'ERR') + '</span>')
         + (e.stream ? ' <span class="tag">流</span>' : '') + '</td>'
-        + '<td>' + nf(e.prompt_tokens) + '/' + nf(e.completion_tokens) + '</td>'
+        + '<td>' + tokCell(e.prompt_tokens) + '/' + tokCell(e.completion_tokens) + '</td>'
         + '<td>' + nf(e.points) + '</td>'
         + '<td>' + (e.latency || 0).toFixed(2) + 's</td>'
         + '<td>' + (e.ttfb === null || e.ttfb === undefined ? '—' : e.ttfb.toFixed(2) + 's') + '</td>'
@@ -763,7 +821,32 @@ async function loadJobs() {
     $('poolRows').innerHTML = rows.map(([k, v]) =>
       '<tr><td class="hint" style="margin:0">' + esc(k)
       + '</td><td><b>' + esc(v) + '</b></td></tr>').join('');
+    // 后台作业（后端接口一直有，前端原来没有入口）
+    try {
+      const jd = await api('/api/panel/jobs');
+      $('jobRows').innerHTML = (jd.jobs || []).length ? (jd.jobs || []).map((j) => '<tr>'
+        + '<td><b>' + esc(j.name) + '</b><div class="hint" style="margin:0">' + esc(j.desc || '') + '</div></td>'
+        + '<td>' + esc(j.interval || '—') + '</td>'
+        + '<td class="mono">' + (j.last_run ? when(j.last_run) : '—') + '</td>'
+        + '<td>' + (j.next_run_in > 0 ? secs(j.next_run_in) + '后' : (j.enabled ? '即将' : '已停用')) + '</td>'
+        + '<td>' + (j.last_error ? '<span style="color:var(--bad)">' + esc(j.last_error) + '</span>' : esc(j.last_result || '—')) + '</td>'
+        + '<td>' + nf(j.runs) + ' / ' + (j.failures ? '<span class="badge b-bad">' + nf(j.failures) + '</span>' : nf(j.failures)) + '</td>'
+        + '<td><button onclick="runJob(\'' + esc(j.key) + '\', this)">手动触发</button></td>'
+        + '</tr>').join('') : '<tr><td colspan="7" class="empty">—</td></tr>';
+    } catch (e) { $('jobRows').innerHTML = '<tr><td colspan="7" class="empty">读取作业失败</td></tr>'; }
   } catch (e) { maybeShowLogin(e); toast('读取任务失败：' + e.message, 'err'); }
+}
+
+async function runJob(key, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/panel/jobs/run', {
+      method: 'POST', body: JSON.stringify({ key }) });
+    const j = r.job || {};
+    toast('已触发' + (j.name || key) + '：' + (j.last_result || j.last_error || '完成'), 'ok');
+    loadJobs();
+  } catch (e) { toast('触发失败：' + e.message, 'err'); }
+  finally { if (btn) btn.disabled = false; }
 }
 
 async function doCheckinView() {
@@ -904,9 +987,9 @@ function showPgResult(msg, finish, usage, ms, streamed) {
   }
   const u = usage || {};
   $('pgMeta').innerHTML = (streamed ? '流式' : '非流式') + ' · finish=' + esc(finish || '—')
-    + ' · tok ' + nf(u.prompt_tokens) + '/' + nf(u.completion_tokens)
+    + ' · tok ' + fmtTok(u.prompt_tokens) + '/' + fmtTok(u.completion_tokens)
     + (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens
-       ? '（思考 ' + nf(u.completion_tokens_details.reasoning_tokens) + '）' : '')
+       ? '（思考 ' + fmtTok(u.completion_tokens_details.reasoning_tokens) + '）' : '')
     + ' · 扣 <b>' + nf(u.points_consumed) + '</b> 分 · ' + (ms / 1000).toFixed(1) + 's';
 }
 

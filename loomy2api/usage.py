@@ -2,9 +2,11 @@
 
 设计取舍
 --------
-* **内存环形缓冲**，不落盘：用量是观测数据，重启丢历史可以接受；落盘反而会把
-  一个高频写入点变成磁盘压力（原版走 Redis 镜像，本机单进程没必要）。
-* 同时维护**聚合**（总量 / 按模型 / 按账号 / 按小时），面板不用每次重算全表。
+* **内存环形缓冲 + JSONL 落盘**：用量是观测数据，网关重启频繁，纯内存
+  台账会让「用量」页时不时清零；逐条追加写 JSON 行文件，开销可忽略。
+* summary 只返回**五档时间窗口**（24小时内 / 当日 / 3天 / 7天 / 30天）
+  的聚合，**不返回历史总量**——总量随环形缓冲截断，数字本身就是错的，
+  还会误导；用量只看窗口内。
 * 记账是**尽力而为**：任何字段缺失都不抛错（上游 usage 结构各模型不一致）。
 """
 
@@ -14,12 +16,24 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
-__all__ = ["UsageLedger", "extract_numbers"]
+__all__ = ["UsageLedger", "extract_numbers", "WINDOWS", "WINDOW_KEYS"]
 
-#: 面板展示用的保留条数
-DEFAULT_MAX_ENTRIES = 500
+#: 面板展示用的保留条数（30 天窗口要有数据，环形缓冲必须盖住 30 天量级；
+#: 当前约 500 条/天，20000 条 ≈ 40 天，内存占用约 8MB，可接受）
+DEFAULT_MAX_ENTRIES = 20000
+
+#: 时间窗口定义：key -> (展示名, 秒数)；"today" 为自然日（服务器本地时区），
+#: 秒数记 None，单独按当天零点计算 cutoff。
+WINDOWS: List[Tuple[str, str, Optional[int]]] = [
+    ("24h", "24小时内", 24 * 3600),
+    ("today", "当日", None),
+    ("3d", "3天内", 3 * 86400),
+    ("7d", "7天内", 7 * 86400),
+    ("30d", "30天内", 30 * 86400),
+]
+WINDOW_KEYS = [key for key, _label, _seconds in WINDOWS]
 
 
 def extract_numbers(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -126,51 +140,104 @@ class UsageLedger:
             items = [e for e in items if e["model"] == model]
         return list(reversed(items[-limit:]))
 
-    def summary(self, *, window_hours: int = 24) -> Dict[str, Any]:
-        """总量 + 按模型 + 按账号 + 最近 N 小时分桶。"""
+    def summary(self) -> Dict[str, Any]:
+        """五档时间窗口统计：24小时内 / 当日 / 3天 / 7天 / 30天。
+
+        每档含 totals + by_model + by_account；另附最近 24h 按小时分桶
+        （趋势用）。**不返回历史总量**——总量随环形缓冲截断，数字是错的。
+        """
         with self._lock:
             items = list(self._entries)
         now = time.time()
-        cutoff = now - max(1, int(window_hours)) * 3600
+        cutoffs: Dict[str, float] = {}
+        for key, _label, seconds in WINDOWS:
+            if seconds is None:  # 自然日：服务器本地时区当天零点
+                lt = time.localtime(now)
+                cutoffs[key] = time.mktime(
+                    (lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0,
+                     lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+            else:
+                cutoffs[key] = now - seconds
 
-        totals = {"requests": 0, "ok": 0, "failed": 0, "prompt_tokens": 0,
-                  "completion_tokens": 0, "reasoning_tokens": 0, "points": 0,
-                  "latency_sum": 0.0, "ttfb_sum": 0.0, "ttfb_n": 0}
-        by_model: Dict[str, Dict[str, Any]] = {}
-        by_account: Dict[str, Dict[str, Any]] = {}
+        def _blank_totals() -> Dict[str, Any]:
+            return {"requests": 0, "ok": 0, "failed": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "reasoning_tokens": 0,
+                    "total_tokens": 0, "points": 0,
+                    "latency_sum": 0.0, "ttfb_sum": 0.0, "ttfb_n": 0}
+
+        def _blank_row() -> Dict[str, Any]:
+            return {"requests": 0, "ok": 0, "failed": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "points": 0, "latency_sum": 0.0}
+
+        wins: Dict[str, Dict[str, Any]] = {}
+        for key, label, _seconds in WINDOWS:
+            wins[key] = {"key": key, "label": label,
+                         "totals": _blank_totals(),
+                         "by_model": {}, "by_account": {}}
+
         buckets: Dict[int, Dict[str, Any]] = {}
+        cutoff_24h = cutoffs["24h"]
 
         for e in items:
-            ok = 200 <= e["status"] < 300
-            totals["requests"] += 1
-            totals["ok" if ok else "failed"] += 1
-            for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "points"):
-                totals[key] += e.get(key, 0)
-            totals["latency_sum"] += e.get("latency", 0)
-            if e.get("ttfb") is not None:
-                totals["ttfb_sum"] += e["ttfb"]
-                totals["ttfb_n"] += 1
+            ts = e.get("ts", 0)
+            status = e.get("status", 0)
+            ok = 200 <= status < 300
+            pt = e.get("prompt_tokens", 0) or 0
+            ct = e.get("completion_tokens", 0) or 0
+            rt = e.get("reasoning_tokens", 0) or 0
+            points = e.get("points", 0) or 0
+            latency = e.get("latency", 0) or 0
+            ttfb = e.get("ttfb")
+            for key, _label, _seconds in WINDOWS:
+                if ts < cutoffs[key]:
+                    continue
+                w = wins[key]
+                t = w["totals"]
+                t["requests"] += 1
+                t["ok" if ok else "failed"] += 1
+                t["prompt_tokens"] += pt
+                t["completion_tokens"] += ct
+                t["reasoning_tokens"] += rt
+                t["total_tokens"] += pt + ct
+                t["points"] += points
+                t["latency_sum"] += latency
+                if ttfb is not None:
+                    t["ttfb_sum"] += ttfb
+                    t["ttfb_n"] += 1
+                for bucket, name in ((w["by_model"], e.get("model") or "(未知)"),
+                                     (w["by_account"], e.get("account") or "(未分配)")):
+                    row = bucket.setdefault(name, _blank_row())
+                    row["requests"] += 1
+                    row["ok" if ok else "failed"] += 1
+                    row["prompt_tokens"] += pt
+                    row["completion_tokens"] += ct
+                    row["points"] += points
+                    row["latency_sum"] += latency
 
-            for bucket, key_name in ((by_model, e.get("model") or "(未知)"),
-                                     (by_account, e.get("account") or "(未分配)")):
-                item = bucket.setdefault(key_name, {
-                    "requests": 0, "ok": 0, "failed": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "points": 0, "latency_sum": 0.0})
-                item["requests"] += 1
-                item["ok" if ok else "failed"] += 1
-                for key in ("prompt_tokens", "completion_tokens", "points"):
-                    item[key] += e.get(key, 0)
-                item["latency_sum"] += e.get("latency", 0)
-
-            if e["ts"] >= cutoff:
-                hour = int(e["ts"] // 3600 * 3600)
+            if ts >= cutoff_24h:
+                hour = int(ts // 3600 * 3600)
                 slot = buckets.setdefault(hour, {"requests": 0, "points": 0,
                                                  "completion_tokens": 0})
                 slot["requests"] += 1
-                slot["points"] += e.get("points", 0)
-                slot["completion_tokens"] += e.get("completion_tokens", 0)
+                slot["points"] += points
+                slot["completion_tokens"] += ct
 
-        def _finish(rows: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        def _finish_totals(t: Dict[str, Any]) -> Dict[str, Any]:
+            n = max(1, t["requests"])
+            return {
+                "requests": t["requests"],
+                "ok": t["ok"],
+                "failed": t["failed"],
+                "prompt_tokens": t["prompt_tokens"],
+                "completion_tokens": t["completion_tokens"],
+                "reasoning_tokens": t["reasoning_tokens"],
+                "total_tokens": t["total_tokens"],
+                "points": t["points"],
+                "avg_latency": round(t["latency_sum"] / n, 2),
+                "avg_ttfb": round(t["ttfb_sum"] / t["ttfb_n"], 2) if t["ttfb_n"] else 0,
+            }
+
+        def _finish_rows(rows: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
             out = []
             for name, item in rows.items():
                 requests = max(1, item["requests"])
@@ -187,26 +254,21 @@ class UsageLedger:
             out.sort(key=lambda r: (-r["points"], -r["requests"]))
             return out
 
-        avg_latency = (totals["latency_sum"] / totals["requests"]) if totals["requests"] else 0
-        avg_ttfb = (totals["ttfb_sum"] / totals["ttfb_n"]) if totals["ttfb_n"] else 0
+        windows = {}
+        for key, label, _seconds in WINDOWS:
+            w = wins[key]
+            windows[key] = {
+                "key": key,
+                "label": label,
+                "totals": _finish_totals(w["totals"]),
+                "by_model": _finish_rows(w["by_model"]),
+                "by_account": _finish_rows(w["by_account"]),
+            }
         return {
-            "totals": {
-                "requests": totals["requests"],
-                "ok": totals["ok"],
-                "failed": totals["failed"],
-                "prompt_tokens": totals["prompt_tokens"],
-                "completion_tokens": totals["completion_tokens"],
-                "reasoning_tokens": totals["reasoning_tokens"],
-                "points": totals["points"],
-                "avg_latency": round(avg_latency, 2),
-                "avg_ttfb": round(avg_ttfb, 2),
-            },
-            "by_model": _finish(by_model),
-            "by_account": _finish(by_account),
+            "windows": windows,
+            "order": [key for key, _label, _seconds in WINDOWS],
             "hours": [dict(buckets[h], hour=h) for h in sorted(buckets)],
-            "window_hours": window_hours,
             "kept": len(items),
-            "since": int(self._started_at),
         }
 
     def clear(self) -> int:

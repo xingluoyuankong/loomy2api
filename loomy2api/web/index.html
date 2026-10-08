@@ -319,6 +319,13 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
 
     <!-- ============ 用量 ============ -->
     <section class="view" id="view-usage">
+      <div class="seg" id="uWinSeg" style="max-width:560px">
+        <button data-win="24h" class="on">24小时内</button>
+        <button data-win="today">当日</button>
+        <button data-win="3d">3天内</button>
+        <button data-win="7d">7天内</button>
+        <button data-win="30d">30天内</button>
+      </div>
       <div class="stats">
         <div class="stat"><div class="v" id="uReq">-</div><div class="k">请求数</div></div>
         <div class="stat good"><div class="v" id="uOk">-</div><div class="k">成功</div></div>
@@ -403,6 +410,12 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
       <section>
         <h3>账号池状态 <small>pool</small></h3>
         <table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody id="poolRows"></tbody></table>
+      </section>
+      <section>
+        <h3>后台作业 <small>background jobs</small></h3>
+        <div class="hint" style="margin:0 0 10px">登录态守护 / 额度刷新 / 粘性清理按周期自动跑；也可手动触发一次（同步执行，账号多时稍等）。</div>
+        <table><thead><tr><th>作业</th><th>周期</th><th>上次运行</th><th>下次</th><th>结果</th><th>运行 / 失败</th><th></th></tr></thead>
+        <tbody id="jobRows"><tr><td colspan="7" class="empty">—</td></tr></tbody></table>
       </section>
     </section>
 
@@ -496,12 +509,12 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
           <div style="margin-top:10px">
             <span style="font-size:13px;color:var(--ink-3)">备用域名（额外兜底 · 不用可忽略）</span>
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
-              <code class="mono" style="font-size:14px;font-weight:600">https://loomy.your-server-ip.nip.io/v1</code>
-              <button class="icon" data-copy="https://loomy.your-server-ip.nip.io/v1" title="复制备用域名（主推）">⧉</button>
+              <code class="mono" style="font-size:14px;font-weight:600">https://loomy.example.com/v1</code>
+              <button class="icon" data-copy="https://loomy.example.com/v1" title="复制备用域名（主推）">⧉</button>
             </div>
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
-              <code class="mono" style="font-size:13px">https://your-server-ip.sslip.io/v1</code>
-              <button class="icon" data-copy="https://your-server-ip.sslip.io/v1" title="复制备用域名（更快）">⧉</button>
+              <code class="mono" style="font-size:13px">https://loomy.example.net/v1</code>
+              <button class="icon" data-copy="https://loomy.example.net/v1" title="复制备用域名（更快）">⧉</button>
             </div>
           </div>
           <div style="margin-top:10px">
@@ -523,7 +536,7 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             <button class="lg" id="keyCopyAll">⧉ 复制整套（URL + Key）</button>
           </div>
           <div class="note info on" style="margin-top:12px;font-size:12px">
-            <b>⚠ 主域名偶发解析不了？</b>主域名的解析链必须经 <code>your-dns.example</code>（DNSHE 免费 DNS，
+            <b>⚠ 主域名偶发解析不了？</b>主域名的解析链必须经 <code>your-dns.example</code>（第三方免费 DNS，
             <code>ns.example-dns.org</code>）这一跳，它在国内<b>偶发超时</b> → 客户端报
             <code>getaddrinfo ENOTFOUND your-domain.example</code>。
             <b>域名本身和证书都没问题</b>，只是这一跳会抖。<br>
@@ -535,8 +548,8 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
             次选 <code>8.8.8.8</code>），域名照原样用。<br>
             <b>备用域名</b>（额外兜底，由 nip.io/sslip.io 权威 DNS 解析，绕开 example-dns.org，
             不影响主域名，可不用）：<br>
-            ③ <code>https://loomy.your-server-ip.nip.io/v1</code>
-            ④ <code>https://your-server-ip.sslip.io/v1</code>
+            ③ <code>https://loomy.example.com/v1</code>
+            ④ <code>https://loomy.example.net/v1</code>
           </div>
           <div class="hint" style="margin-top:10px;font-size:12px">
             用法：<code>Authorization: Bearer &lt;API Key&gt;</code>（OpenAI SDK 直接可用）。
