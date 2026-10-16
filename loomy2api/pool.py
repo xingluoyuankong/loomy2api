@@ -81,6 +81,8 @@ class AccountPool:
         self.inflight = InflightTracker(
             limit=int(cfg.get("max_inflight_per_account") or 0))
         self._rng = __import__("random").Random()
+        # 「本地已过期但无密码续不了」的告警去重表：账号名 -> 告警时的 expire_at
+        self._stale_warned: Dict[str, int] = {}
         # 后台作业台账（面板「任务中心」页的数据源）
         self._jobs: Dict[str, Dict] = {}
         self._init_jobs()
@@ -180,6 +182,10 @@ class AccountPool:
         for idx, item in enumerate(items or []):
             if isinstance(item, dict):
                 accounts.append(Account.from_dict(item, idx))
+        # 本地 TTL 只是乐观估计（不是上游下发的），宽限期必须在载入时就生效，
+        # 否则 usable() 在第一次 ensure_session 之前仍会按裸 14 天判死。
+        for acc in accounts:
+            self._apply_grace(acc)
 
         if self.cfg.get("sessions_from_client", True):
             accounts.extend(self._client_accounts(existing=accounts))
@@ -362,22 +368,69 @@ class AccountPool:
 
     def ensure_session(self, acc: Account, *, force: bool = False) -> Account:
         """Log in / refresh the account session when needed."""
+        self._apply_grace(acc)
         renew_days = float(self.cfg.get("session_renew_before_days") or 3)
         needs = force or not acc.session_valid
         if not needs and acc.days_left is not None and acc.days_left < renew_days:
-            needs = True
-            self.log(f"账号 {acc.name} session 剩余 {acc.days_left:.1f} 天，提前续期")
+            # 只有真的能续（手里有密码）才动。无密码时本地 TTL 只是乐观估计 ——
+            # 上游 session 实测远长于 14 天（2026-10-16：loomy-3147 本地「已过期
+            # 0.28 天」，上游 /points/records 仍回 200 available=3811），
+            # 提前重登只会白跑一次登录而且还把好号踢下线。
+            if acc.loginid and acc.password:
+                needs = True
+                self.log(f"账号 {acc.name} session 剩余 {acc.days_left:.1f} 天，提前续期")
         if not needs:
             return acc
         if not (acc.loginid and acc.password):
+            if acc.session:
+                # 手里还有凭证就放行让上游裁决，不在本地提前判死。
+                # 2026-10-13 的旧补丁只改了这里「不抛异常」，但没改
+                # ``Account.session_valid`` / ``pool.usable()`` 的过滤 ——
+                # loomy-3147 照样被 usable() 滤掉、流量全挤到单号，抖动时全站 502。
+                self._warn_session_stale(acc)
+                return acc
             raise PoolError(
                 f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
                 f"（请在 accounts.json 补 loginid/password，或用 `loomy2api login` 短信登录）")
         self.client.fill(acc)
         self.save()
+        self._stale_warned.pop(acc.name, None)      # 换新 session，重新计告警
         self.log(f"账号 {acc.name} 登录成功 userid={acc.userid} "
                  f"session={acc.session[:8]}… 剩余 {(acc.days_left or 0):.1f} 天")
         return acc
+
+    def _apply_grace(self, acc: Account) -> int:
+        """按 config 的 ``session_grace_days`` 给账号注入宽限期。
+
+        ``Account.grace_seconds`` 默认 0（= 用 constants 的默认值），
+        这里允许运行时覆盖，方便上游真的收紧 session 寿命时不用改代码。
+        """
+        days = float(self.cfg.get("session_grace_days") or 0)
+        acc.grace_seconds = int(days * 86400) if days > 0 else 0
+        return acc.grace_seconds
+
+    def _warn_session_stale(self, acc: Account) -> None:
+        """本地 TTL 过了、又没密码续 —— 按需告警，**绝不每请求刷屏**。
+
+        旧实现每个请求打两行「session 剩余 X 天且无密码无法自动续期 /
+        到期前继续服务，请尽快短信重登」，结果是：
+          * 真正的 502/504 故障日志被这两行冲掉，排障时看不见；
+          * 误导人工以为号要死了、跑去短信重登一个压根活着的号。
+        现在：宽限期内静默（上游大概率还认）；只有超出宽限期才提示人工介入，
+        且同一批 session（同一 ``expire_at``）只报一次。
+        """
+        if acc.expire_at <= 0:
+            return
+        grace_days = (acc.grace_seconds or C.SESSION_GRACE_SECONDS) / 86400
+        overdue = (time.time() - acc.expire_at) / 86400
+        if overdue <= grace_days:
+            return                                   # 宽限期内：静默
+        if self._stale_warned.get(acc.name) == acc.expire_at:
+            return                                   # 同批 session 已报过
+        self._stale_warned[acc.name] = acc.expire_at
+        self.log(f"[warn] 账号 {acc.name} session 本地已过期 {overdue:.1f} 天"
+                 f"（超出宽限 {grace_days:.0f} 天）且无密码无法自动重登，"
+                 f"上游可能已拒绝；请用 `loomy2api login` 短信重登")
 
     def refresh_quota_light(self, acc: Account) -> Account:
         """轻量额度刷新：只拉一次上游 quota()（余额/每日/可用）。
@@ -458,10 +511,11 @@ class AccountPool:
         """
         now = time.time()
         out: List[Account] = []
+        stale_out: List[Account] = []
         for acc in self.accounts:
             if not acc.enabled or acc.name in exclude:
                 continue
-            if not acc.healthy(now) or not acc.session_valid:
+            if not acc.healthy(now) or not acc.session:
                 continue
             if acc.available == 0:                 # 额度确认为 0 → 不参与
                 continue
@@ -469,8 +523,11 @@ class AccountPool:
                 continue
             if self.inflight.full(acc.name):
                 continue
-            out.append(acc)
-        return out
+            # 本地 TTL 已过期（宽限内）的号当「预备队」：还有 TTL 未过的候选
+            # 时不掺入，全员都过了本地 TTL 才放行 —— 让上游 401/403 终裁凭证
+            # 真伪，而不是像旧代码那样直接滤死、单号一抖全站 502。
+            (stale_out if acc.session_stale else out).append(acc)
+        return out or stale_out
 
     def acquire(self, exclude: Sequence[str] = (), model: str = "",
                 session_key_value: Optional[str] = None) -> Account:
@@ -482,20 +539,41 @@ class AccountPool:
         now = time.time()
 
         # 1) 会话粘性：同一个会话尽量落在同一个账号，保住多轮上下文
+        #    （绑定按 TTL 自然过期，不滚动续期 —— 到期后重新选号实现轮换）
+        old_bound: Optional[str] = None
         if session_key_value:
+            # 先看有没有过期绑定（get 会把它清掉，所以先 peek）
+            old_bound = self.sticky.peek_expired(session_key_value)
             bound = self.sticky.get(session_key_value)
             if bound and bound not in exclude:
                 acc = self.get(bound)
                 if acc is not None and acc.healthy(now) and acc.session_valid \
                         and not self.inflight.full(acc.name):
-                    self.ensure_session(acc)
-                    acc.last_used = now
-                    self.inflight.acquire(acc.name)
-                    return acc
-                self.sticky.unbind(session_key_value, bound)
+                    try:
+                        self.ensure_session(acc)
+                    except PoolError as exc:
+                        # 绑定的账号 session 已死：解绑后掉到常规选号，
+                        # 不能让一个僵尸账号杀死整个请求（2026-10-13 实锤）
+                        self.log(f"[warn] 粘性账号 {acc.name} session 不可用，"
+                                 f"解绑后重新选号：{exc}")
+                        self.sticky.unbind(session_key_value, bound)
+                    else:
+                        acc.last_used = now
+                        self.inflight.acquire(acc.name)
+                        return acc
+                else:
+                    self.sticky.unbind(session_key_value, bound)
 
         # 2) 常规选号
         candidates = self.usable(exclude, model=model)
+        # 绑定过期 → 优先换号（逼出轮换）：把旧账号从候选中拿掉，
+        # 保证长对话到期后一定切到别的号，而不是 50/50 随机可能连中。
+        # 如果拿掉后无候选（旧号是唯一可用），则不拿（别把自己逼死）。
+        if old_bound:
+            rotated = [c for c in candidates if c.name != old_bound]
+            if rotated:
+                candidates = rotated
+                self.log(f"会话绑定过期，轮换：{old_bound} → 重新选号")
         if not candidates:
             # 没有健康账号：给单账号/全冷却场景一次自愈机会
             all_enabled = [a for a in self.accounts
@@ -510,16 +588,41 @@ class AccountPool:
                            and not self.inflight.full(a.name)]
                 candidates = relaxed or []
             if not candidates:
+                # 先要「本地仍判有效」的：本地 TTL 过期已经不代表凭证失效
+                # （见 account.session_valid），但没必要优先把流量送给它。
+                candidates = [a for a in all_enabled
+                              if a.session_valid and not self.inflight.full(a.name)]
+            if not candidates:
+                # 一个本地有效的都没有了：放行本地已过期的号，让上游 401/403
+                # 终裁 —— 总比直接 502 甩给客户端强（网关有失败换号重试）。
                 candidates = [a for a in all_enabled if not self.inflight.full(a.name)]
             self.log("没有健康账号，尝试对现有账号续期/重登")
 
-        acc = self._pick(candidates)
-        self.ensure_session(acc)
-        acc.last_used = now
-        self.inflight.acquire(acc.name)
-        if session_key_value:
-            self.sticky.bind(session_key_value, acc.name)
-        return acc
+        # 3) 逐个尝试：ensure_session 失败就换下一个候选，
+        #    不让单个僵尸账号杀死整个请求（之前是直接抛 PoolError，
+        #    上层 core() 遇到就 break，请求失败而不是换号重试）
+        remaining = [c for c in candidates if c.name not in exclude]
+        last_err: Optional[Exception] = None
+        while remaining:
+            acc = self._pick(remaining)
+            if acc is None:
+                break
+            try:
+                self.ensure_session(acc)
+            except PoolError as exc:
+                last_err = exc
+                self.log(f"[warn] 账号 {acc.name} 跳过（session 不可用）：{exc}")
+                remaining = [c for c in remaining if c.name != acc.name]
+                if session_key_value:
+                    self.sticky.unbind(session_key_value, acc.name)
+                continue
+            acc.last_used = now
+            self.inflight.acquire(acc.name)
+            if session_key_value:
+                self.sticky.bind(session_key_value, acc.name)
+            return acc
+        raise PoolError(
+            f"账号池里没有可用账号（session 均不可用）：{last_err}")
 
     def _pick(self, candidates: Sequence[Account]) -> Account:
         """按策略选号。

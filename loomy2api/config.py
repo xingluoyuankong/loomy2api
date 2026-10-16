@@ -54,6 +54,11 @@ DEFAULTS: Dict[str, Any] = {
     "keepalive_min_tokens": 1500,
     "cooldown_seconds": 300,      # 兜底冷却（未分类错误）
     "session_renew_before_days": 3,
+    # 本地 session TTL 过期后的宽限期（天）。expire_at 是本地按
+    # constants.SESSION_EXPIRE_SECONDS（客户端声称的 14 天）编的，不是上游下发的；
+    # 2026-10-16 实测本地「已过期 0.28 天」的 session 上游仍回 200。
+    # 宽限期内不本地判死，由上游 401/403 终裁。0 / 不配 = 用 constants 默认值。
+    "session_grace_days": 0,
     "quota_refresh_minutes": 30,
     # 用量台账内存保留条数（30 天窗口要有数据；当前约 500 条/天，
     # 20000 条 ≈ 40 天，内存占用约 8MB）

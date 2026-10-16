@@ -132,13 +132,16 @@ class TestStickyRouter(unittest.TestCase):
         time.sleep(0.05)
         self.assertIsNone(r.get("c-1"))
 
-    def test_rolling_renewal_keeps_active_session(self):
+    def test_no_rolling_renewal_binding_expires(self):
+        # 2026-10-13 改为不滚动续期：绑定从首次 bind 起最多存活 ttl，
+        # 到期后重新选号，实现长对话的账号轮换（之前滚动续期把
+        # 3.5 小时长对话锁死单号）。
         # 余量放大，避免 CI/机器负载抖动导致偶发失败
-        r = StickyRouter(ttl=1.0)
+        r = StickyRouter(ttl=0.3)
         r.bind("c-1", "accA")
-        for _ in range(3):
-            time.sleep(0.15)
-            self.assertEqual(r.get("c-1"), "accA")   # 命中即续期
+        self.assertEqual(r.get("c-1"), "accA")   # ttl 内命中
+        time.sleep(0.4)                           # 超过 ttl
+        self.assertIsNone(r.get("c-1"))           # 不续期，已过期
 
     def test_unbind_only_matching_name(self):
         r = StickyRouter(ttl=60)

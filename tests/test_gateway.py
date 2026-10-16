@@ -105,6 +105,38 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertIn("fake-model", ids)
         self.assertTrue(all(m.get("owned_by") != "alias" for m in payload["data"]))
 
+    def test_refresh_models_releases_account(self):
+        """refresh_models 拿了账号必须 release（之前漏了，在途计数泄漏）。"""
+        self.gateway.pool.inflight.limit = 2
+        self.gateway.refresh_models()
+        self.assertEqual(self.gateway.pool.inflight.snapshot(), {})
+
+    def test_models_refresher_thread_starts(self):
+        """定时刷新线程能启动（2026-10-13：之前根本没有定时刷新）。"""
+        self.gateway.start_models_refresher()
+        t = self.gateway._models_thread
+        self.assertTrue(t.is_alive())
+        self.assertTrue(t.daemon)
+        # 幂等：再调一次不会起第二个
+        self.gateway.start_models_refresher()
+        self.assertIs(self.gateway._models_thread, t)
+        self.gateway._models_stop.set()
+
+    def test_daily_checkin_thread_starts(self):
+        """每日自动签到线程能启动（2026-10-14：之前只有手动按钮）。"""
+        self.gateway.start_daily_checkin()
+        t = self.gateway._checkin_thread
+        self.assertTrue(t.is_alive())
+        self.assertTrue(t.daemon)
+        self.gateway.start_daily_checkin()
+        self.assertIs(self.gateway._checkin_thread, t)
+        self.gateway._checkin_stop.set()
+
+    def test_daily_checkin_disabled_by_config(self):
+        self.gateway.cfg.update({"daily_checkin": "false"})
+        self.gateway.start_daily_checkin()
+        self.assertFalse(hasattr(self.gateway, "_checkin_thread"))
+
     def test_chat_non_stream(self):
         status, body, _ = self.post("/v1/chat/completions", {
             "model": "imodel/fake-model",

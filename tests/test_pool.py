@@ -134,6 +134,100 @@ class TestPool(unittest.TestCase):
         self.assertEqual(acc.requests, 1)
 
 
+    # ---- 2026-10-13 回归：僵尸账号不能杀死整个池 ----
+    def test_ensure_session_valid_no_password_warns_and_allows(self):
+        """session 有效但无密码做提前续期：放行+告警，不抛错。
+
+        实锤：loomy-3147 剩 2.3 天 < 3 天续期阈值，无密码，
+        旧逻辑直接抛 PoolError，等于提前 3 天把好号判死刑，
+        流量全挤到单号上。
+        """
+        self._write([
+            {"name": "zombie", "loginid": "13800000001",
+             "session": "s1", "expireAt": int(time.time()) + 2 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("zombie")
+        self.assertTrue(acc.session_valid)
+        self.assertLess(acc.days_left, 3)
+        pool.ensure_session(acc)                      # 不抛错
+        self.assertEqual(pool.acquire().name, "zombie")
+
+    def test_ensure_session_invalid_no_password_raises(self):
+        """session 真过期了且无密码：照样抛错（防御）。"""
+        self._write([
+            {"name": "dead", "loginid": "13800000001",
+             "session": "", "expireAt": 0},
+        ])
+        pool = AccountPool(self.cfg)
+        with self.assertRaises(PoolError):
+            pool.ensure_session(pool.get("dead"))
+
+    def test_acquire_skips_expired_account(self):
+        self._write([
+            {"name": "dead", "session": "s1",
+             "expireAt": int(time.time()) - 100},
+            {"name": "alive", "session": "s2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        self.assertEqual(pool.acquire().name, "alive")
+
+    def test_acquire_failover_loop_on_ensure_failure(self):
+        """_pick 选中但 ensure_session 失败 → 换下一个候选，不抛错。"""
+        from unittest import mock
+        self._write([
+            {"name": "a", "session": "s1",
+             "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "b", "session": "s2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        self.cfg["strategy"] = "balance"
+        pool = AccountPool(self.cfg)
+        pool.get("a").available = 9999      # balance 策略必选 a
+        pool.get("b").available = 1
+        real_ensure = pool.ensure_session
+
+        def flaky(acc, **kw):
+            if acc.name == "a":
+                raise PoolError("session dead")
+            return real_ensure(acc, **kw)
+
+        with mock.patch.object(pool, "ensure_session", flaky):
+            self.assertEqual(pool.acquire().name, "b")
+
+    def test_acquire_all_dead_raises(self):
+        from unittest import mock
+        self._write([
+            {"name": "a", "session": "s1",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        with mock.patch.object(pool, "ensure_session",
+                               side_effect=PoolError("dead")):
+            with self.assertRaises(PoolError):
+                pool.acquire()
+
+    def test_sticky_expiry_forces_rotation(self):
+        """绑定过期后重新选号：强制换号，不回旧号（2026-10-13 主人要轮换）。"""
+        self._write([
+            {"name": "a", "session": "s1",
+             "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "b", "session": "s2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        pool.sticky.ttl = 0.05          # 50ms，快速过期
+        acc1 = pool.acquire(session_key_value="c-1")
+        pool.release(acc1)
+        time.sleep(0.1)                # 绑定过期
+        acc2 = pool.acquire(session_key_value="c-1")
+        pool.release(acc2)
+        # 必须换号：a→b 或 b→a，不许原地踏步
+        self.assertNotEqual(acc2.name, acc1.name)
+
+
+
 class TestSessionLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -209,6 +303,20 @@ class TestSessionLifecycle(unittest.TestCase):
         pool.tick()
         self.assertFalse(pool.get("a").session_valid)
 
+    def test_save_sets_owner_only_permissions(self):
+        import os
+        import stat
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "session": "s", "password": "pw",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        pool.save(force=True)
+        mode = stat.S_IMODE(os.stat(self.dir / "accounts.json").st_mode)
+        self.assertEqual(mode, 0o600)
+
     def test_refresh_quota_light_single_upstream_call(self):
         from tests.support import write_accounts
 
@@ -276,7 +384,6 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertEqual(acc.points_used, 42)
         self.assertEqual(acc.daily_consumed, 7)
         self.assertEqual(acc.available, 11)
-
 
 if __name__ == "__main__":
     unittest.main()

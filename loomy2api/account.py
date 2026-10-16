@@ -95,8 +95,11 @@ class Account:
 
     session: str = ""
     userid: str = ""
-    expire_at: int = 0           # unix seconds
+    expire_at: int = 0           # unix seconds（本地估计值，非上游下发）
     obtained_at: int = 0
+    #: 本地 TTL 过期后的宽限期（秒）；0 = 用 constants.SESSION_GRACE_SECONDS。
+    #: 不落盘（from_dict/to_dict 是显式白名单），每次由 pool 按配置注入。
+    grace_seconds: int = 0
 
     #: per-account device identity (devid / ua / campus device id / …)
     identity: Dict[str, Any] = field(default_factory=dict)
@@ -130,8 +133,30 @@ class Account:
 
     # ------------------------------------------------------------------
     @property
+    def session_stale(self) -> bool:
+        """本地 TTL 已过期（不论是否还在宽限内）——用于告警分级，不用于路由。
+
+        ``expire_at`` 是本地按 ``SESSION_EXPIRE_SECONDS`` 编的，不是上游给的；
+        见 ``constants.SESSION_GRACE_SECONDS`` 的实测说明。
+        """
+        return bool(self.session) and self.expire_at > 0 \
+            and time.time() >= self.expire_at
+
+    @property
     def session_valid(self) -> bool:
-        return bool(self.session) and (self.expire_at == 0 or self.expire_at > time.time())
+        """能否参与选号。**本地 TTL 过期不等于凭证失效。**
+
+        ``expire_at == 0`` 视为「未知」→ 放行；本地 TTL 已过 → 宽限期内继续
+        放行，由上游 401/403 终裁。只有 ``session`` 为空（真实 401 后已被清空）
+        或宽限期也过了才判 False。
+        """
+        if not self.session:
+            return False
+        if self.expire_at == 0:
+            return True
+        grace = self.grace_seconds if self.grace_seconds > 0 \
+            else C.SESSION_GRACE_SECONDS
+        return time.time() < self.expire_at + grace
 
     @property
     def days_left(self) -> Optional[float]:
@@ -573,12 +598,46 @@ class AccountClient:
         account.session = got["session"]
         account.userid = got.get("userid", "")
         account.obtained_at = int(time.time())
-        account.expire_at = account.obtained_at + C.SESSION_EXPIRE_SECONDS
+        # 上游若回了真实过期时间就用它；解析不到则回落客户端声称的 14 天。
+        # 回落路径与旧行为完全一致，所以即使上游字段名猜错也不会变差。
+        real = _parse_expire_at(got, account.obtained_at)
+        account.expire_at = real or (account.obtained_at + C.SESSION_EXPIRE_SECONDS)
         return account
 
 
-def _extract_session(payload: Dict[str, Any]) -> Dict[str, str]:
-    """Pull session/userid/phone out of whatever shape the server returns."""
+#: 上游登录响应里**可能**出现的过期时间字段名（绝对秒 / 毫秒 / 相对秒）。
+#: 未实测过具体哪一个存在 —— 所以全部尝试，解析不到一律回落
+#: ``SESSION_EXPIRE_SECONDS``，保证「猜错也不比旧行为差」。
+_EXPIRE_FIELD_KEYS = (
+    "expireAt", "expire_at", "expireTime", "expire_time",
+    "sessionExpire", "session_expire", "expiresAt", "expires_at",
+    "expire",                                                 # 请求体同名字段
+)
+_EXPIRE_IN_FIELD_KEYS = ("expiresIn", "expires_in", "expireIn", "expire_in", "ttl")
+
+
+def _parse_expire_at(node: Dict[str, Any], obtained_at: int) -> int:
+    """从登录响应里尽量抠出绝对过期时间戳（秒）。抠不到返回 0。"""
+    for key in _EXPIRE_FIELD_KEYS:
+        val = node.get(key)
+        if not isinstance(val, (int, float)) or val <= 0:
+            continue
+        val = int(val)
+        if val > 10 ** 12:            # 毫秒级 epoch（如 1800086400000）
+            return val // 1000
+        if val > 10 ** 9:             # 秒级 epoch（2001-09 之后）；当相对秒数
+            return val               # 解读会得到「31 年后」，荒谬，直接当绝对
+        if 60 <= val <= 365 * 86400:  # 相对秒数（如 1209600 = 14 天）
+            return obtained_at + val
+    for key in _EXPIRE_IN_FIELD_KEYS:
+        val = node.get(key)
+        if isinstance(val, (int, float)) and 60 <= val <= 365 * 86400:
+            return obtained_at + int(val)
+    return 0
+
+
+def _extract_session(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull session/userid/phone (and any real expiry) out of the response."""
     node = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     if not isinstance(node, dict):
         raise AccountError(f"unexpected login payload: {payload}")
@@ -587,4 +646,5 @@ def _extract_session(payload: Dict[str, Any]) -> Dict[str, str]:
         raise AccountError(f"login succeeded but returned no session: {payload}")
     userid = str(node.get("userid") or node.get("userId") or "")
     phone = str(node.get("phone") or node.get("loginid") or "")
-    return {"session": session, "userid": userid, "phone": phone}
+    return {"session": session, "userid": userid, "phone": phone,
+            "expire_at": _parse_expire_at(node, int(time.time()))}

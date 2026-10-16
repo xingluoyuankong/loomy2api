@@ -167,6 +167,22 @@ class StickyRouter:
     def enabled(self) -> bool:
         return self.ttl > 0 and self.max_entries != 0
 
+    def peek_expired(self, key: Optional[str]) -> Optional[str]:
+        """返回已过期但尚未被清理的绑定账号名。
+
+        用于绑定过期后重新选号时**优先换号**（逼出轮换），而不是
+        50/50 随机可能连续命中同一账号。
+        """
+        if not key or not self.enabled:
+            return None
+        now = time.time()
+        with self._lock:
+            item = self._map.get(key)
+            if not item:
+                return None
+            name, expire = item
+            return name if expire <= now else None
+
     def get(self, key: Optional[str]) -> Optional[str]:
         if not key or not self.enabled:
             return None
@@ -179,8 +195,11 @@ class StickyRouter:
             if expire <= now:
                 self._map.pop(key, None)
                 return None
-            # 命中即滚动续期：活跃会话不会中途掉绑定
-            self._map[key] = (name, now + self.ttl)
+            # 注意：这里**不做**滚动续期。绑定从首次 bind 起最多存活 ttl 秒，
+            # 到期后重新走加权选号 —— 长对话也能定期轮换账号，避免单号被
+            # 锁死几小时、另一个号零消耗（2026-10-13 实锤：滚动续期让
+            # 3.5 小时的 GLM 长对话全程绑死 loomy-7280）。
+            # 短期连续性不受影响：ttl 内（默认 30 分钟）的多轮对话仍走同一账号。
             return name
 
     def bind(self, key: Optional[str], name: str) -> None:

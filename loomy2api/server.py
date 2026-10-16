@@ -184,6 +184,7 @@ class Gateway:
     # -- model catalogue -------------------------------------------------
 
     def refresh_models(self) -> list:
+        acc = None
         try:
             acc = self.pool.acquire()
             payload = self.models_client.models(acc.session)
@@ -204,7 +205,83 @@ class Gateway:
                 self.models = [dict(m, object="model", owned_by="loomy")
                                for m in C.FALLBACK_MODELS]
                 self.log(f"[warn] 拉取模型列表失败，使用内置清单：{exc}")
+        finally:
+            if acc is not None:
+                # 之前漏了 release，在途计数一直占着（默认不限所以没爆，
+                # 但开了 max_inflight_per_account 就会慢慢占满）
+                self.pool.release(acc)
         return self.models
+
+    def start_models_refresher(self) -> None:
+        """后台线程：定期刷新上游模型列表。
+
+        之前只在启动时拉一次，7 天不更新用户都发现不了
+        （2026-10-13 实锤：10-06 到 10-13 零刷新）。
+        默认 24 小时，可配 ``models_refresh_hours``（最少 1 小时）。
+        """
+        if getattr(self, "_models_thread", None) \
+                and self._models_thread.is_alive():
+            return
+        interval = max(3600, int(float(self.cfg.get("models_refresh_hours")
+                                      or 24) * 3600))
+        stop = threading.Event()
+        self._models_stop = stop
+
+        def _loop() -> None:
+            # 启动时 start() 已经刷过一次，这里先睡满一个周期
+            while not stop.wait(interval):
+                try:
+                    self.refresh_models()
+                except Exception as exc:                # noqa: BLE001
+                    self.log(f"[warn] 模型列表定时刷新异常：{exc}")
+
+        t = threading.Thread(target=_loop, name="models-refresher", daemon=True)
+        t.start()
+        self._models_thread = t
+        self.log(f"模型列表定时刷新已启动（每 {interval / 3600:.1f} 小时）")
+
+    def start_daily_checkin(self) -> None:
+        """后台线程：每日自动签到（领每日积分）。
+
+        之前只有面板手动按钮，用户忘记点就断档
+        （2026-10-14 实锤：3147 烧光额度后才发现当天没签到，
+        但周期内已领过，再点也领不到）。
+        每天 UTC 00:30 后检查一次（错开整点），上游幂等，
+        已领过则直接跳过。可配 ``daily_checkin`` false 关闭。
+        """
+        if getattr(self, "_checkin_thread", None) \
+                and self._checkin_thread.is_alive():
+            return
+        if str(self.cfg.get("daily_checkin", "true")).lower() in ("0", "false", "no"):
+            self.log("每日自动签到已关闭（daily_checkin=false）")
+            return
+        stop = threading.Event()
+        self._checkin_stop = stop
+        last_date = {"v": ""}
+
+        def _loop() -> None:
+            import datetime as _dt
+            while not stop.wait(3600):          # 每小时看一眼
+                try:
+                    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+                    if today == last_date["v"]:
+                        continue
+                    # 每天 00:30 UTC 后再签，错开整点重置
+                    now_utc = _dt.datetime.now(_dt.timezone.utc)
+                    if now_utc.hour == 0 and now_utc.minute < 30:
+                        continue
+                    result = self.panel.checkin()
+                    ok = sum(1 for r in result.get("results", []) if r.get("ok"))
+                    total = len(result.get("results", []))
+                    self.log(f"[checkin] 每日自动签到完成：{ok}/{total} 个账号成功")
+                    last_date["v"] = today
+                except Exception as exc:        # noqa: BLE001
+                    self.log(f"[warn] 每日自动签到异常：{exc}")
+
+        t = threading.Thread(target=_loop, name="daily-checkin", daemon=True)
+        t.start()
+        self._checkin_thread = t
+        self.log("每日自动签到已启动（每天 UTC 00:30 后执行）")
 
     def catalogue(self) -> list:
         with self._models_lock:
@@ -234,6 +311,8 @@ class Gateway:
         self.pool.bootstrap()
         self.pool.start()
         self.refresh_models()
+        self.start_models_refresher()
+        self.start_daily_checkin()
 
 
 # ------------------------------------------------------------------ handler
