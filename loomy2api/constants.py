@@ -43,26 +43,12 @@ CLIENT_PUBLIC_ROOT = r"C:\Users\Public\Loomy"
 # ---------------------------------------------------------------- account
 
 #: The client always asks for a 14-day session; there is no refresh token.
+#:
+#: 注意（2026-10-16 实测）：这只是客户端**声称**的时长，登录响应里没有可解析
+#: 的过期字段，``expire_at`` 全是本地按这个值编的。实测 loomy-3147「过期」
+#: 0.28 天后上游仍回 200 —— 所以它只用于展示/维护播报（account.session_stale），
+#: **绝不参与路由判定**；凭证死活唯一权威是上游 401/403。
 SESSION_EXPIRE_SECONDS = 14 * 24 * 3600
-
-#: ``SESSION_EXPIRE_SECONDS`` 过期后的宽限期（秒）——**只做本地兜底，不替代上游鉴权**。
-#:
-#: 背景（2026-10-16 实测，根因）：登录响应里没有可解析的过期字段，
-#: ``account._extract_session`` 只取 ``session/userid/phone``。于是
-#: ``expire_at`` 是本地按 ``SESSION_EXPIRE_SECONDS`` 编出来的，不是上游给的。
-#: 而客户端声称的 14 天**严重偏短**：当时 loomy-3147 本地「已过期 0.28 天」，
-#: 上游 ``GET /points/records`` 仍回 HTTP 200（available=3811）。
-#:
-#: 后果：``Account.session_valid`` 到期即 False → ``pool.usable()`` 把它滤掉 →
-#: 流量全挤到唯一剩下的号 → 那个号一遇上游 502/504 抖动就直接 502 甩给客户端
-#: （日志里 `账号池里没有可用账号（session 均不可用）` 的来源），
-#: 并且每个请求都刷两行「请尽快短信重登」，把真正的故障日志淹没。
-#:
-#: 修正：本地 TTL 过期不再判死，宽限期内继续参与选号；
-#: 凭证真伪交给上游 ``401/403`` 终裁（``pool.report_failure`` /
-#: ``pool.refresh_quota_light`` 已经实现了清 session + 冷却）。
-#: 可用 ``session_grace_days`` 配置覆盖。
-SESSION_GRACE_SECONDS = 30 * 24 * 3600
 
 DEVICE_ID = "web"
 WEB_MODEL_ID = "Web"

@@ -256,6 +256,16 @@ function loadView(view) {
 
 /* --------------------------------------------------------- 账号池 */
 
+/* 本地 expire_at 是编出来的假值（上游登录响应没有过期字段），没有「剩余」
+   可言 —— 只展示事实：已服役多少天、实测过多少寿命。 */
+function sessionAgeCell(a) {
+  if (a.session_age_days === null || a.session_age_days === undefined) return '—';
+  let s = '服役 ' + a.session_age_days.toFixed(1) + ' 天';
+  if (a.session_observed_lifetime_days)
+    s += '<div class="hint" style="margin:0">实测 ≥ ' + a.session_observed_lifetime_days + ' 天</div>';
+  return s;
+}
+
 function badge(a) {
   if (!a.enabled) return '<span class="badge b-off">已禁用</span>';
   if (a.in_breaker) return '<span class="badge b-bad">熔断 ' + secs(a.breaker_seconds_left) + '</span>';
@@ -264,11 +274,11 @@ function badge(a) {
     return '<span class="badge b-warn">' + kind + ' ' + secs(a.cooldown_seconds_left) + '</span>';
   }
   if (!a.session) return '<span class="badge b-bad">无登录态</span>';
-  if (a.session_days_left !== null && a.session_days_left < 3)
-    return '<span class="badge b-warn">即将到期</span>';
   if (a.available === 0) return '<span class="badge b-warn">额度用尽</span>';
   const mc = Object.keys(a.model_cooldowns || {}).length;
-  return '<span class="badge b-ok">正常</span>' +
+  const ageTag = (a.session_age_days !== null && !a.has_password && a.session_age_days >= 14)
+    ? ' <span class="badge b-warn">无密码 · 服役 ' + a.session_age_days.toFixed(0) + ' 天</span>' : '';
+  return '<span class="badge b-ok">正常</span>' + ageTag +
     (mc ? ' <span class="badge b-warn">' + mc + ' 模型限流</span>' : '');
 }
 
@@ -312,7 +322,7 @@ function renderState(state) {
       + '<td><b>' + esc(a.name) + '</b><div class="hint" style="margin:0">' + mode + '</div></td>'
       + '<td class="mono">' + esc(a.loginid_masked || '—') + '</td>'
       + '<td>' + badge(a) + '</td>'
-      + '<td>' + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</td>'
+      + '<td>' + sessionAgeCell(a) + '</td>'
       + '<td><b>' + num(a.available) + '</b><div class="hint" style="margin:0">余 ' + num(a.balance) + ' + 日 ' + num(a.daily_balance) + '</div>'
       + (a.quota_updated_at ? '<div class="hint" style="margin:0">🕐 ' + esc(quotaAge(state.now, a.quota_updated_at)) + '</div>' : '')
       + '</td>'

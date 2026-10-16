@@ -163,15 +163,22 @@ class TestPool(unittest.TestCase):
         with self.assertRaises(PoolError):
             pool.ensure_session(pool.get("dead"))
 
-    def test_acquire_skips_expired_account(self):
+    def test_acquire_skips_only_sessionless_account(self):
+        """本地 TTL 过期不再是门槛（expire_at 是编的假值）；
+        唯一出局条件是手里没有 session（真实 401 清空后）。"""
         self._write([
-            {"name": "dead", "session": "s1",
+            {"name": "dead", "session": "",
+             "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "stale_ttl", "session": "s9",
              "expireAt": int(time.time()) - 100},
             {"name": "alive", "session": "s2",
              "expireAt": int(time.time()) + 14 * 86400},
         ])
         pool = AccountPool(self.cfg)
-        self.assertEqual(pool.acquire().name, "alive")
+        names = {pool.acquire().name for _ in range(6)}
+        self.assertNotIn("dead", names)          # 没 session：出局
+        self.assertIn("stale_ttl", names)        # TTL 过期：照常轮换
+        self.assertIn("alive", names)
 
     def test_acquire_failover_loop_on_ensure_failure(self):
         """_pick 选中但 ensure_session 失败 → 换下一个候选，不抛错。"""
@@ -237,12 +244,14 @@ class TestSessionLifecycle(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_expiring_session_triggers_relogin(self):
+    def test_aged_session_triggers_relogin(self):
+        """有密码的号按「役龄 >= session_renew_days」主动重登（不再看假 TTL）。"""
         from tests.support import write_accounts
 
         write_accounts(self.dir / "accounts.json", [
             {"name": "a", "loginid": "13800000001", "password": "pw",
-             "session": "stale", "expireAt": int(time.time()) + 3600},   # < 3 days
+             "session": "stale", "obtainedAt": int(time.time()) - 11 * 86400,
+             "expireAt": int(time.time()) + 3 * 86400},
         ])
         pool = AccountPool(self.cfg)
 

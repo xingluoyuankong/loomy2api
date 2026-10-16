@@ -95,7 +95,7 @@ class AccountPool:
         self._jobs = {
             "session_keeper": {
                 "name": "登录态守护",
-                "desc": "巡检 session，剩余天数低于阈值自动重登",
+                "desc": "巡检 session，按役龄主动重登（无密码号仅播报役龄）",
                 "interval": f"{interval_min} 分钟",
                 "interval_seconds": interval_min * 60,
                 "last_run": 0, "last_result": "", "last_error": "",
@@ -182,10 +182,8 @@ class AccountPool:
         for idx, item in enumerate(items or []):
             if isinstance(item, dict):
                 accounts.append(Account.from_dict(item, idx))
-        # 本地 TTL 只是乐观估计（不是上游下发的），宽限期必须在载入时就生效，
-        # 否则 usable() 在第一次 ensure_session 之前仍会按裸 14 天判死。
-        for acc in accounts:
-            self._apply_grace(acc)
+        # 本地 expire_at 是编出来的假值、不参与路由（见 session_valid），
+        # 载入时无需任何 TTL 相关处理。
 
         if self.cfg.get("sessions_from_client", True):
             accounts.extend(self._client_accounts(existing=accounts))
@@ -367,70 +365,82 @@ class AccountPool:
     # ------------------------------------------------------ session keep
 
     def ensure_session(self, acc: Account, *, force: bool = False) -> Account:
-        """Log in / refresh the account session when needed."""
-        self._apply_grace(acc)
-        renew_days = float(self.cfg.get("session_renew_before_days") or 3)
-        needs = force or not acc.session_valid
-        if not needs and acc.days_left is not None and acc.days_left < renew_days:
-            # 只有真的能续（手里有密码）才动。无密码时本地 TTL 只是乐观估计 ——
-            # 上游 session 实测远长于 14 天（2026-10-16：loomy-3147 本地「已过期
-            # 0.28 天」，上游 /points/records 仍回 200 available=3811），
-            # 提前重登只会白跑一次登录而且还把好号踢下线。
-            if acc.loginid and acc.password:
-                needs = True
-                self.log(f"账号 {acc.name} session 剩余 {acc.days_left:.1f} 天，提前续期")
-        if not needs:
+        """按需重登：session 没了必登；有密码且役龄到阈值则主动续。
+
+        本地不判凭证死活（``expire_at`` 是编出来的假值）：session 只要还在
+        就照常服务，上游 401/403 是唯一权威（收到即清 session 并记录实测
+        寿命）。无密码的号在这里永远静默 —— 役龄提示走维护通道。
+        """
+        if force or not acc.session_valid:
+            if not (acc.loginid and acc.password):
+                if acc.session:
+                    return acc                # 还有凭证：放着让上游裁决
+                raise PoolError(
+                    f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
+                    f"（请在 accounts.json 补 loginid/password，或用 `loomy2api login` 短信登录）")
+            self.client.fill(acc)
+            self.save()
+            self._stale_warned.pop(acc.name, None)
+            self.log(f"账号 {acc.name} 重新登录成功 userid={acc.userid} "
+                     f"session={acc.session[:8]}…")
             return acc
-        if not (acc.loginid and acc.password):
-            if acc.session:
-                # 手里还有凭证就放行让上游裁决，不在本地提前判死。
-                # 2026-10-13 的旧补丁只改了这里「不抛异常」，但没改
-                # ``Account.session_valid`` / ``pool.usable()`` 的过滤 ——
-                # loomy-3147 照样被 usable() 滤掉、流量全挤到单号，抖动时全站 502。
-                self._warn_session_stale(acc)
-                return acc
-            raise PoolError(
-                f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
-                f"（请在 accounts.json 补 loginid/password，或用 `loomy2api login` 短信登录）")
-        self.client.fill(acc)
-        self.save()
-        self._stale_warned.pop(acc.name, None)      # 换新 session，重新计告警
-        self.log(f"账号 {acc.name} 登录成功 userid={acc.userid} "
-                 f"session={acc.session[:8]}… 剩余 {(acc.days_left or 0):.1f} 天")
+        # 役龄到阈值 + 手里有密码 → 主动重登，赶在上游拒绝之前换新（不中断服务）
+        if acc.loginid and acc.password:
+            age = acc.session_age_days
+            if age is not None and age >= self._renew_after_days(acc):
+                self.client.fill(acc)
+                self.save()
+                self.log(f"账号 {acc.name} session 已服役 {age:.1f} 天，"
+                         f"主动重登续期（新 session={acc.session[:8]}…）")
         return acc
 
-    def _apply_grace(self, acc: Account) -> int:
-        """按 config 的 ``session_grace_days`` 给账号注入宽限期。
+    def _renew_after_days(self, acc: Account) -> float:
+        """主动重登的役龄阈值（天）。
 
-        ``Account.grace_seconds`` 默认 0（= 用 constants 的默认值），
-        这里允许运行时覆盖，方便上游真的收紧 session 寿命时不用改代码。
+        默认 ``session_renew_days``（10 天，客户端声称 14 天、留 4 天余量）；
+        若实测过真实寿命（observed_lifetime），取 ``min(默认, 实测×0.8)`` ——
+        上游真有上限时按实测提前续，实测比声称的长也不冒进。
         """
-        days = float(self.cfg.get("session_grace_days") or 0)
-        acc.grace_seconds = int(days * 86400) if days > 0 else 0
-        return acc.grace_seconds
+        base = float(self.cfg.get("session_renew_days") or 10)
+        if acc.observed_lifetime > 0:
+            return min(base, acc.observed_lifetime / 86400 * 0.8)
+        return base
 
-    def _warn_session_stale(self, acc: Account) -> None:
-        """本地 TTL 过了、又没密码续 —— 按需告警，**绝不每请求刷屏**。
+    def _record_session_death(self, acc: Account) -> None:
+        """上游 401/403 = 凭证真死了：记下这份 session 的实测寿命。
 
-        旧实现每个请求打两行「session 剩余 X 天且无密码无法自动续期 /
-        到期前继续服务，请尽快短信重登」，结果是：
-          * 真正的 502/504 故障日志被这两行冲掉，排障时看不见；
-          * 误导人工以为号要死了、跑去短信重登一个压根活着的号。
-        现在：宽限期内静默（上游大概率还认）；只有超出宽限期才提示人工介入，
-        且同一批 session（同一 ``expire_at``）只报一次。
+        这是整个系统里唯一能学到真实 TTL 的时刻 —— 之后密码号的重登阈值
+        会自动收敛到「实测 × 0.8」，越跑越准。
         """
-        if acc.expire_at <= 0:
+        if not acc.obtained_at or acc.observed_lifetime > 0:
             return
-        grace_days = (acc.grace_seconds or C.SESSION_GRACE_SECONDS) / 86400
-        overdue = (time.time() - acc.expire_at) / 86400
-        if overdue <= grace_days:
-            return                                   # 宽限期内：静默
-        if self._stale_warned.get(acc.name) == acc.expire_at:
-            return                                   # 同批 session 已报过
-        self._stale_warned[acc.name] = acc.expire_at
-        self.log(f"[warn] 账号 {acc.name} session 本地已过期 {overdue:.1f} 天"
-                 f"（超出宽限 {grace_days:.0f} 天）且无密码无法自动重登，"
-                 f"上游可能已拒绝；请用 `loomy2api login` 短信重登")
+        acc.observed_lifetime = max(0, int(time.time() - acc.obtained_at))
+        self.log(f"账号 {acc.name} 实测 session 寿命 "
+                 f"{acc.observed_lifetime / 86400:.2f} 天（被上游拒绝时役龄）")
+
+    def _note_session_age(self, acc: Account) -> None:
+        """维护通道里的役龄播报：只报事实，每份 session 只报一次。
+
+        措辞原则：不写「剩余 X 天」（本地 TTL 是编的假值，没有「剩余」可言），
+        只写「已服役 N 天」；不诱导人去重登活着的号；无密码才提示，
+        有密码的号由 ensure_session 按役龄自动续。
+        """
+        age = acc.session_age_days
+        if age is None or not acc.session:
+            return
+        if acc.loginid and acc.password:
+            return                      # 有密码：自动续，不需要人管
+        if self._stale_warned.get(acc.name) == acc.obtained_at:
+            return                      # 同一份 session 已播报过
+        claimed = C.SESSION_EXPIRE_SECONDS / 86400
+        if age < claimed:
+            return                      # 声称范围内，不扰
+        self._stale_warned[acc.name] = acc.obtained_at
+        learned = (f"，此前实测寿命 ≥ {acc.observed_lifetime / 86400:.0f} 天"
+                   if acc.observed_lifetime else "")
+        self.log(f"[note] 账号 {acc.name} session 已服役 {age:.1f} 天"
+                 f"（超过客户端声称的 {claimed:.0f} 天{learned}），"
+                 f"仍在上游正常使用；无密码无法主动续期，失效以上游 401 为准")
 
     def refresh_quota_light(self, acc: Account) -> Account:
         """轻量额度刷新：只拉一次上游 quota()（余额/每日/可用）。
@@ -445,6 +455,7 @@ class AccountPool:
             quota = self.gateway.quota(acc.session, proxy=acc.proxy or None)
         except UpstreamError as exc:
             if exc.status in (401, 403):
+                self._record_session_death(acc)
                 acc.session, acc.expire_at = "", 0
                 self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
             else:
@@ -511,7 +522,6 @@ class AccountPool:
         """
         now = time.time()
         out: List[Account] = []
-        stale_out: List[Account] = []
         for acc in self.accounts:
             if not acc.enabled or acc.name in exclude:
                 continue
@@ -523,11 +533,11 @@ class AccountPool:
                 continue
             if self.inflight.full(acc.name):
                 continue
-            # 本地 TTL 已过期（宽限内）的号当「预备队」：还有 TTL 未过的候选
-            # 时不掺入，全员都过了本地 TTL 才放行 —— 让上游 401/403 终裁凭证
-            # 真伪，而不是像旧代码那样直接滤死、单号一抖全站 502。
-            (stale_out if acc.session_stale else out).append(acc)
-        return out or stale_out
+            # 本地 TTL（expire_at）是编出来的假值，**不作为路由门槛** ——
+            # 所有还持有 session 的号正常参与轮换，凭证死活由上游 401/403
+            # 终裁（report_failure 清 session + 记录实测寿命）。
+            out.append(acc)
+        return out
 
     def acquire(self, exclude: Sequence[str] = (), model: str = "",
                 session_key_value: Optional[str] = None) -> Account:
@@ -704,9 +714,11 @@ class AccountPool:
         acc.last_error = reason or f"HTTP {status}"
 
         if status in (401, 403):
+            self._record_session_death(acc)
             acc.session, acc.expire_at = "", 0
             acc.cool(float(self.cfg.get("cooldown_seconds") or 60), "soft", acc.last_error)
-            self.log(f"账号 {acc.name} 登录态被拒（HTTP {status}）→ 清 session")
+            self.log(f"账号 {acc.name} 登录态被上游拒绝（HTTP {status}）→ 清 session，"
+                     f"等待重登")
         elif status == 402:
             until = next_day_4am()
             acc.cool_hard(until, acc.last_error)
@@ -798,6 +810,7 @@ class AccountPool:
             acc.prune_model_cooldowns()
             if not acc.enabled:
                 continue
+            self._note_session_age(acc)
             try:
                 before = acc.session
                 self.ensure_session(acc)

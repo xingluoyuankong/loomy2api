@@ -73,10 +73,10 @@ def cmd_accounts(cfg, args) -> int:
     snap = pool.snapshot()
     print(f"策略 {snap['strategy']} · 账号 {snap['count']} 个 · 可用 {snap['usable']} 个")
     print("-" * 78)
-    header = f"{'名称':<18}{'可用积分':>10}{'剩余天数':>10}{'请求':>6}{'扣分':>7}  状态"
+    header = f"{'名称':<18}{'可用积分':>10}{'服役天数':>10}{'请求':>6}{'扣分':>7}  状态"
     print(header)
     for acc in pool.accounts:
-        days = f"{acc.days_left:.1f}" if acc.days_left is not None else "-"
+        days = f"{acc.session_age_days:.1f}" if acc.session_age_days is not None else "-"
         state = "正常"
         if not acc.enabled:
             state = "已禁用"
@@ -138,7 +138,7 @@ def cmd_login(cfg, args) -> int:
             pool.ensure_session(acc, force=True)
             pool.refresh_quota(acc)
             print(f"✓ {acc.name}: userid={acc.userid} session={acc.session[:8]}… "
-                  f"剩余 {(acc.days_left or 0):.1f} 天 · {_human_quota(acc)}")
+                  f"已服役 {(acc.session_age_days or 0):.1f} 天 · {_human_quota(acc)}")
         except (AccountError, PoolError) as exc:
             failed += 1
             print(f"✗ {acc.name}: {exc}")

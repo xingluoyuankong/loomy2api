@@ -97,9 +97,10 @@ class Account:
     userid: str = ""
     expire_at: int = 0           # unix seconds（本地估计值，非上游下发）
     obtained_at: int = 0
-    #: 本地 TTL 过期后的宽限期（秒）；0 = 用 constants.SESSION_GRACE_SECONDS。
-    #: 不落盘（from_dict/to_dict 是显式白名单），每次由 pool 按配置注入。
-    grace_seconds: int = 0
+    #: 实测 session 真实寿命（秒）：某个 session 被上游 401/403 拒绝时，
+    #: 记录「被拒那一刻的役龄」。这是唯一能学到真实 TTL 的时刻，
+    #: 用于密码号「按役龄主动重登」的调度。落盘（observedLifetime）。
+    observed_lifetime: int = 0
 
     #: per-account device identity (devid / ua / campus device id / …)
     identity: Dict[str, Any] = field(default_factory=dict)
@@ -133,30 +134,33 @@ class Account:
 
     # ------------------------------------------------------------------
     @property
-    def session_stale(self) -> bool:
-        """本地 TTL 已过期（不论是否还在宽限内）——用于告警分级，不用于路由。
+    def session_age_days(self) -> Optional[float]:
+        """当前 session 已服役天数（自 obtained_at 起）；未知返回 None。"""
+        if not self.session or not self.obtained_at:
+            return None
+        return (time.time() - self.obtained_at) / 86400
 
-        ``expire_at`` 是本地按 ``SESSION_EXPIRE_SECONDS`` 编的，不是上游给的；
-        见 ``constants.SESSION_GRACE_SECONDS`` 的实测说明。
+    @property
+    def session_stale(self) -> bool:
+        """客户端声称的 14 天 TTL 已过 —— **仅信息展示用，绝不参与路由判定**。
+
+        ``expire_at`` 是本地按 ``SESSION_EXPIRE_SECONDS`` 编的（登录响应里没有
+        可解析的过期字段），实测上游寿命远超 14 天（2026-10-16：loomy-3147
+        「过期」0.28 天，上游 /points/records 仍回 200 available=3811）。
+        凭证死活的唯一权威是上游 401/403。
         """
         return bool(self.session) and self.expire_at > 0 \
             and time.time() >= self.expire_at
 
     @property
     def session_valid(self) -> bool:
-        """能否参与选号。**本地 TTL 过期不等于凭证失效。**
+        """能否参与选号：手里有 session 就算，**本地不做任何 TTL 门槛**。
 
-        ``expire_at == 0`` 视为「未知」→ 放行；本地 TTL 已过 → 宽限期内继续
-        放行，由上游 401/403 终裁。只有 ``session`` 为空（真实 401 后已被清空）
-        或宽限期也过了才判 False。
+        本地没有可靠依据判断凭证死活（expire_at 是编的假值）；唯一权威是
+        上游 401/403 —— ``report_failure`` / ``refresh_quota_light`` 收到即
+        清 session 并记录实测寿命。本地到期提示只走维护通道（不刷屏）。
         """
-        if not self.session:
-            return False
-        if self.expire_at == 0:
-            return True
-        grace = self.grace_seconds if self.grace_seconds > 0 \
-            else C.SESSION_GRACE_SECONDS
-        return time.time() < self.expire_at + grace
+        return bool(self.session)
 
     @property
     def days_left(self) -> Optional[float]:
@@ -295,6 +299,8 @@ class Account:
         acc.points_used = int(raw.get("pointsUsed") or 0)
         acc.failures = int(raw.get("failures") or 0)
         acc.daily_consumed = int(raw.get("dailyConsumed") or 0)
+        acc.observed_lifetime = int(raw.get("observedLifetime")
+                                     or raw.get("observed_lifetime") or 0)
         return acc
 
     def to_dict(self) -> Dict[str, Any]:
@@ -316,6 +322,8 @@ class Account:
             out["expireAt"] = self.expire_at
         if self.obtained_at:
             out["obtainedAt"] = self.obtained_at
+        if self.observed_lifetime:
+            out["observedLifetime"] = self.observed_lifetime
         # 运行计数也落盘：重启不该把「已扣积分/请求数」清零（用户对账要用）
         out["requests"] = int(self.requests)
         out["pointsUsed"] = int(self.points_used)
@@ -351,6 +359,10 @@ class Account:
             "proxy": self.proxy or "",
             "session": (self.session[:8] + "…") if self.session else "",
             "session_days_left": (round(self.days_left, 2) if self.days_left is not None else None),
+            "session_age_days": (round(self.session_age_days, 2)
+                                 if self.session_age_days is not None else None),
+            "session_observed_lifetime_days": (round(self.observed_lifetime / 86400, 2)
+                                               if self.observed_lifetime else None),
             "expire_at": self.expire_at,
             "balance": self.balance,
             "daily_balance": self.daily_balance,
