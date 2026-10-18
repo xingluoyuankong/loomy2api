@@ -138,11 +138,19 @@ class ModelGateway:
         """→ ``{balance, daily_balance, available}``."""
         payload = self.points_records(session, page_size=1, proxy=proxy)
         data = payload.get("data") or {}
-        return {
+        out = {
             "balance": data.get("balance"),
             "daily_balance": data.get("dailyBalance"),
             "available": data.get("availableBalance"),
         }
+        # 业务码级登录失效（HTTP 仍 200，实测 code=100002 desc=登录已失效）：
+        # 透传给 refresh_quota_light 做面板红牌，**不抛异常**——签到等其它
+        # 端点可能仍可用，不能按 401 清 session（2026-10-18 loomy-6579 实锤）。
+        code, desc = payload.get("code"), str(payload.get("desc") or "")
+        if code == 100002 or "登录已失效" in desc:
+            out["_biz_code"] = code
+            out["_biz_desc"] = desc
+        return out
 
     def points_breakdown(self, session: str, proxy: Optional[str] = None,
                          max_pages: int = 10) -> Dict[str, Any]:

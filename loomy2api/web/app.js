@@ -268,6 +268,10 @@ function sessionAgeCell(a) {
 
 function badge(a) {
   if (!a.enabled) return '<span class="badge b-off">已禁用</span>';
+  if (a.login_state) return '<span class="badge b-bad" title="面板统计端点返回「'
+    + esc(a.login_state) + '」（code=100002，HTTP 200）。签到/对话调用可能仍可用，'
+    + '不能清 session，真正失效以上游 401 为准。">⚠ ' + esc(a.login_state)
+    + '</span> <span class="badge b-warn">统计停更</span>';
   if (a.in_breaker) return '<span class="badge b-bad">熔断 ' + secs(a.breaker_seconds_left) + '</span>';
   if (a.in_cooldown) {
     const kind = a.cooldown_kind === 'hard' ? '硬冷却' : '冷却';
@@ -287,6 +291,7 @@ function renderState(state) {
   const t = state.totals, c = state.config, p = state.pool || {};
   const cooling = state.accounts.filter((a) => a.enabled && (a.in_cooldown || a.in_breaker)).length;
   const disabled = state.accounts.filter((a) => !a.enabled).length;
+  const loginBad = state.accounts.filter((a) => a.enabled && a.login_state).length;
 
   $('sTotal').textContent = t.accounts;
   $('sHealthy').textContent = t.usable;
@@ -302,11 +307,14 @@ function renderState(state) {
     + ' · 熔断阈值 ' + (p.breaker_threshold || '-')
     + ' · 模型 ' + c.models + ' 个'
     + ' · 额度自动刷新 ' + (c.panel_quota_refresh_seconds || 60) + 's'
-    + (c.auth_required ? ' · 已开启 Key 校验' : ' · 未设 Key（仅本机）');
+    + (c.auth_required ? ' · 已开启 Key 校验' : ' · 未设 Key（仅本机）')
+    + (loginBad ? ' · ⚠ ' + loginBad + ' 个账号面板登录失效' : '');
 
   $('navPool').textContent = t.usable + '/' + t.accounts + ' 可用';
   $('navPulse').className = 'pulse' + (t.usable ? '' : ' bad');
-  $('navState').textContent = t.usable ? '运行中' : '无可用账号';
+  $('navState').textContent = t.usable
+    ? (loginBad ? '运行中 · ' + loginBad + ' 登录失效' : '运行中')
+    : '无可用账号';
 
   if (!state.accounts.length) {
     $('rows').innerHTML = '<tr><td colspan="10" class="empty">还没有账号，点右上角「添加账号」</td></tr>';

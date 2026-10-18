@@ -130,6 +130,10 @@ class Account:
     daily_consumed: int = 0      # 上游 dailyConsumed：当日已扣（用户对账口径）
     failures: int = 0
     last_error: str = ""
+    #: 面板统计端点（points/first-login）业务码级登录失效（如 code=100002，
+    #: HTTP 仍是 200）。**运行态，不落盘**：签到/对话调用可能仍可用，
+    #: 不能按 401 清 session —— 只做面板红牌提示，失效以上游 401 为准。
+    login_state: str = ""
     source: str = "config"       # config | client
 
     # ------------------------------------------------------------------
@@ -389,6 +393,7 @@ class Account:
             },
             "source": self.source,
             "last_error": self.last_error,
+            "login_state": self.login_state,
             "identity": self.identity_view(),
         }
         return out

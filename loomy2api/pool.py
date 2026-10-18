@@ -466,6 +466,13 @@ class AccountPool:
             acc.last_error = f"quota: {exc}"
             self.log(f"账号 {acc.name} 额度查询异常（网络？）：{exc}")
             return acc
+        if quota.get("_biz_code") or "登录已失效" in str(quota.get("_biz_desc") or ""):
+            # 业务码级登录失效（HTTP 200，code=100002）：之前只在这里静默
+            # 拿到 None 额度，面板上毫无提示。落 login_state，账号列表红牌。
+            acc.login_state = "登录已失效"
+            self.log(f"账号 {acc.name} 额度接口登录失效"
+                     f"（code={quota.get('_biz_code')}）→ 面板标记登录失效",
+                     level="WARN")
         acc.balance = quota.get("balance")
         acc.daily_balance = quota.get("daily_balance")
         acc.available = quota.get("available")
@@ -503,9 +510,21 @@ class AccountPool:
             data = fl.get("data") or {}
             daily_consumed = data.get("dailyConsumed")
             if daily_consumed is None:
-                # 频繁调用时上游可能拒绝：留痕，避免静默 None 难排查
-                self.log(f"账号 {acc.name} dailyConsumed 未取到："
-                         f"code={fl.get('code')} desc={str(fl.get('desc'))[:60]}")
+                code, desc = fl.get("code"), str(fl.get("desc") or "")
+                if code == 100002 or "登录已失效" in desc:
+                    # 业务码级「登录已失效」（HTTP 仍 200）：签到/对话可能仍
+                    # 可用，不能按 401 清 session —— 落状态字段，账号列表红牌。
+                    acc.login_state = "登录已失效"
+                    self.log(f"账号 {acc.name} dailyConsumed 未取到："
+                             f"code={code} desc={desc[:60]} → 面板标记登录失效",
+                             level="WARN")
+                else:
+                    # 频繁调用时上游可能拒绝：留痕，避免静默 None 难排查
+                    self.log(f"账号 {acc.name} dailyConsumed 未取到："
+                             f"code={code} desc={desc[:60]}")
+            elif acc.login_state:
+                # 拿到当日扣分 = 该端点已恢复，失效标记自愈
+                acc.login_state = ""
         except Exception as exc:                        # noqa: BLE001
             self.log(f"账号 {acc.name} 当日扣分查询失败：{exc}")
         if daily_consumed is not None:
