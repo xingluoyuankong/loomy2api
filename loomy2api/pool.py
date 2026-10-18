@@ -738,9 +738,24 @@ class AccountPool:
                 self.log(f"账号 {acc.name} 限流（429）→ 软冷却 {left:.0f}s"
                          f"（streak={acc.soft_streak}）")
         elif status == 404:
-            acc.cool(float(self.cfg.get("not_found_cooldown_seconds") or 60),
-                     "soft", acc.last_error)
-            self.log(f"账号 {acc.name} HTTP 404 → 短冷却 60s")
+            if model:
+                # 404 + 模型 → 上游没有这个模型 / 不支持该调用方式
+                # （如 doubao-seedream-5-lite 是 image 模型却被打 chat 端点）。
+                # 这是**请求**的问题，不是账号的问题；之前的实现会把账号
+                # 打进 60s 短冷却，客户端持续重试就把全池账号挨个冷掉
+                # （2026-10-18 日志实锤）。改成模型级冷却：只挡这个模型，
+                # 其它模型照常走该账号。
+                until = time.time() + float(
+                    self.cfg.get("model_404_cooldown_seconds") or 600)
+                acc.model_cooldowns[model] = {
+                    "until": until, "reason": "HTTP 404 模型不存在/端点不支持",
+                    "hits": 1}
+                self.log(f"账号 {acc.name} 模型 {model} HTTP 404 → "
+                         f"模型级冷却 600s（不冷却账号）")
+            else:
+                acc.cool(float(self.cfg.get("not_found_cooldown_seconds") or 60),
+                         "soft", acc.last_error)
+                self.log(f"账号 {acc.name} HTTP 404 → 短冷却 60s")
         elif status in (400, 422):
             # 请求本身不合法（上游 invalid_request_error），换一个账号结果
             # 一样 —— 之前的实现会冷却账号 300s，客户端一个坏请求就能把

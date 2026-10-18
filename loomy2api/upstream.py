@@ -89,7 +89,10 @@ class ModelGateway:
                         f"&pageSize={page_size}")
         status, _h, data = http_request(
             url, method="GET", headers=self._headers(session),
-            timeout=30, proxy=self._proxy(proxy))
+            # 之前写死 30s：高峰期 read operation timed out 反复出现
+            # （额度查询/累计消耗汇总全走这里）。改可配 panel_timeout，默认 60s。
+            timeout=float(self.cfg.get("panel_timeout") or 60),
+            proxy=self._proxy(proxy))
         if status != 200:
             raise UpstreamError(f"/points/records HTTP {status}", status)
         return json.loads(data.decode("utf-8"))

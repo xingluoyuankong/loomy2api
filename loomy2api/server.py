@@ -339,15 +339,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, obj: Any, extra: Optional[dict] = None) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        for key, value in (extra or {}).items():
-            self.send_header(key, str(value))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for key, value in (extra or {}).items():
+                self.send_header(key, str(value))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, TimeoutError) as exc:
+            # 客户端已断开（中途取消/读超时自杀）——静默收场，别再往死管道写。
+            # 之前这里抛 BrokenPipeError 会被调用方的兜底 except 接住再走
+            # _error()（也是写死管道），连打两段 traceback、还给日志留一条
+            # 假 502（2026-10-18 日志实锤：/v1/chat/completions 与
+            # /api/panel/state 都出现过）。
+            self.close_connection = True
+            try:
+                self.gateway.log(f"{self.command} {self._path()} → 客户端已断开，"
+                                 f"响应丢弃（{type(exc).__name__}）",
+                                 level="WARN")
+            except Exception:                           # noqa: BLE001
+                pass
 
     def _error(self, status: int, message: str, kind: str = "invalid_request_error") -> None:
         # Drain any unread request body and close the connection: on Windows an
@@ -754,6 +769,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._passthrough("embeddings")
             if path == "/v1/images/generations":
                 return self._passthrough("images/generations")
+            if path == "/v1/responses":
+                return self._responses()
             if path in ("/v1/admin/accounts/reload", "/admin/accounts/reload"):
                 self.gateway.pool.load()
                 self.gateway.refresh_models()
@@ -939,10 +956,6 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         status, headers, data = gw.models_client.call(
             acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {})
-        if status >= 400:
-            gw.pool.report_failure(acc, status, data[:200].decode("utf-8", "replace"))
-        else:
-            gw.pool.report_success(acc)
         # 记账：生图一次扣上百积分，之前完全不进台账，「用量」页自然是错的。
         # points 在响应**顶层**（images/generations 无 usage 对象，实测）。
         try:
@@ -952,18 +965,34 @@ class Handler(BaseHTTPRequestHandler):
         points = body.get("points_consumed") if isinstance(body, dict) else None
         if points is None and isinstance(body, dict):
             points = (body.get("usage") or {}).get("points_consumed")
-        gw.usage.record(account=acc.name, model=str(
-            (json.loads(raw.decode("utf-8")) if raw else {}).get("model") or suffix),
+        try:
+            req_model = str((json.loads(raw.decode("utf-8")) if raw else {})
+                            .get("model") or "")
+        except ValueError:
+            req_model = ""
+        if status >= 400:
+            # 带上 model：404（模型不存在）才能落进模型级冷却分支，
+            # 不至于把唯一账号打进 60s 短冷却。
+            gw.pool.report_failure(acc, status,
+                                   data[:200].decode("utf-8", "replace"),
+                                   model=req_model)
+        else:
+            gw.pool.report_success(acc)
+        gw.usage.record(account=acc.name, model=req_model or suffix,
             status=status, usage={} if points is None
             else {"points_consumed": int(points or 0)},
             latency=time.time() - t0, kind="image" if "images" in suffix else "passthrough",
             proxy=acc.proxy or "")
-        self.send_response(status)
-        self.send_header("Content-Type",
-                         headers.get("Content-Type", "application/json"))
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type",
+                             headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, TimeoutError):
+            self.close_connection = True
 
     # ---------------------------------------------------------- chat (core)
 
@@ -1100,12 +1129,243 @@ class Handler(BaseHTTPRequestHandler):
             return (200, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
         return last
 
+    # ------------------------------------------------- Responses API 兼容层
+
+    def _responses(self) -> None:
+        """OpenAI Responses API（``/v1/responses``）最小兼容层。
+
+        上游只有 chat/completions；这里把 Responses 请求转成 chat 请求调
+        上游，再把结果包回 Responses 形状（非流式直接回 JSON；流式用
+        SSE 事件流伪流式下发）。之前该路径直接 404，带 key 的客户端
+        （如 Codex CLI）每打一次就是一条 WARN + 404。
+        """
+        gw = self.gateway
+        req = self._read_json()
+        model = gw.resolve_model(req.get("model"))
+
+        messages: list = []
+        instr = req.get("instructions")
+        if isinstance(instr, str) and instr.strip():
+            messages.append({"role": "system", "content": instr})
+        inp = req.get("input")
+        if isinstance(inp, str):
+            messages.append({"role": "user", "content": inp})
+        elif isinstance(inp, list):
+            for item in inp:
+                if not isinstance(item, dict):
+                    continue
+                itype = item.get("type") or ("message" if item.get("role") else "")
+                if itype in ("", "message"):
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        content = "".join(
+                            p.get("text", "") for p in content
+                            if isinstance(p, dict) and isinstance(p.get("text"), str))
+                    if content is None:
+                        content = ""
+                    messages.append({"role": item.get("role") or "user",
+                                     "content": content})
+                elif itype == "function_call_output":
+                    messages.append({"role": "tool",
+                                     "tool_call_id": item.get("call_id") or "",
+                                     "content": str(item.get("output") or "")})
+        if not messages:
+            return self._error(400, "input 不能为空 / input required",
+                               "invalid_request_error")
+        chat_req: Dict[str, Any] = {"model": model, "messages": messages}
+        if req.get("max_output_tokens"):
+            chat_req["max_tokens"] = int(req["max_output_tokens"])
+        for key in ("temperature", "top_p"):
+            if req.get(key) is not None:
+                chat_req[key] = req[key]
+
+        status, data = self._chat_upstream(chat_req, model, tag="responses")
+        if status != 200:
+            try:
+                body = json.loads(data.decode("utf-8"))
+            except Exception:                       # noqa: BLE001
+                body = {"error": {"message":
+                                  data[:500].decode("utf-8", "replace"),
+                                  "type": "upstream_error", "code": status}}
+            return self._json(status, body)
+        try:
+            obj = json.loads(data.decode("utf-8"))
+        except Exception:                           # noqa: BLE001
+            return self._error(502, "上游返回非 JSON / upstream non-JSON",
+                               "upstream_error")
+        resp = self._responses_from_chat(obj, model)
+
+        if not req.get("stream"):
+            return self._json(200, resp)
+
+        # 伪流式：上游一次性返回，这里按 Responses SSE 事件序列下发。
+        # 大多数客户端只需要事件帧结构，对逐 token 真流式不做强依赖。
+        def _evt(name: str, payload: dict) -> bool:
+            try:
+                self.wfile.write(
+                    f"event: {name}\ndata: ".encode("utf-8")
+                    + json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    + b"\n\n")
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError, TimeoutError):
+                self.close_connection = True
+                return False
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+        seq = resp.get("output") or []
+        in_prog = dict(resp, status="in_progress")
+        if not _evt("response.created", {"response": in_prog,
+                                         "sequence_number": 0}):
+            return
+        n = 1
+        text_all = ""
+        for item in seq:
+            if not _evt("response.output_item.added",
+                        {"output_index": seq.index(item), "item": item,
+                         "sequence_number": n}):
+                return
+            n += 1
+            if item.get("type") == "message":
+                for part in item.get("content") or []:
+                    if part.get("type") != "output_text":
+                        continue
+                    text = part.get("text") or ""
+                    for i in range(0, len(text), 64):
+                        if not _evt("response.output_text.delta",
+                                    {"type": "output_text",
+                                     "text": text[i:i + 64],
+                                     "item_id": item.get("id"),
+                                     "output_index": seq.index(item),
+                                     "content_index": 0,
+                                     "sequence_number": n}):
+                            return
+                        n += 1
+                    text_all += text
+                    if not _evt("response.output_text.done",
+                                {"type": "output_text", "text": text,
+                                 "item_id": item.get("id"),
+                                 "output_index": seq.index(item),
+                                 "content_index": 0,
+                                 "sequence_number": n}):
+                        return
+                    n += 1
+            if not _evt("response.output_item.done",
+                        {"output_index": seq.index(item), "item": item,
+                         "sequence_number": n}):
+                return
+            n += 1
+        _evt("response.completed", {"response": resp, "sequence_number": n})
+
+    def _responses_from_chat(self, obj: Dict[str, Any],
+                             model: str) -> Dict[str, Any]:
+        """chat.completion → OpenAI Responses API 对象。"""
+        choice = (obj.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        usage = obj.get("usage") or {}
+        ctd = usage.get("completion_tokens_details") or {}
+        output: list = []
+        if reasoning:
+            output.append({"type": "reasoning",
+                           "id": "rs_" + uuid.uuid4().hex[:24],
+                           "summary": [{"type": "summary_text",
+                                        "text": reasoning}]})
+        output.append({"type": "message",
+                       "id": "msg_" + uuid.uuid4().hex[:24],
+                       "status": "completed", "role": "assistant",
+                       "content": [{"type": "output_text",
+                                    "text": content, "annotations": []}]})
+        return {"id": "resp_" + uuid.uuid4().hex[:24], "object": "response",
+                "created_at": int(time.time()), "status": "completed",
+                "model": model, "output": output,
+                "output_text": content, "error": None,
+                "incomplete_details": None,
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {
+                        "reasoning_tokens": ctd.get("reasoning_tokens", 0)},
+                }}
+
+    def _chat_upstream(self, chat_req: Dict[str, Any], model: str,
+                       tag: str = "") -> Tuple[int, bytes]:
+        """独立的上游调用核（带重试/记账/冷却），Responses 兼容层专用。"""
+        gw = self.gateway
+        tried: list = []
+        last: Tuple[int, bytes] = (0, b"")
+        pool_err = ""
+        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+            try:
+                acc = gw.pool.acquire(model=model)
+            except PoolError as exc:
+                pool_err = str(exc)
+                gw.log(f"[warn] {exc}")
+                break
+            tried.append(acc.name)
+            started = time.time()
+            try:
+                status, _hdrs, data = gw.models_client.call(
+                    acc.session, "chat/completions", chat_req,
+                    proxy=acc.proxy or None)
+            finally:
+                gw.pool.release(acc)
+            if status == 200:
+                try:
+                    usage = (json.loads(data.decode("utf-8")) or {}).get(
+                        "usage") or {}
+                except Exception:                   # noqa: BLE001
+                    usage = {}
+                elapsed = time.time() - started
+                gw.pool.report_success(acc, usage, model=model)
+                gw.usage.record(account=acc.name, model=model, status=200,
+                                usage=usage, latency=elapsed, kind="chat",
+                                proxy=acc.proxy)
+                gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s http=200 "
+                       f"{human_usage(usage)}{_rate(usage, elapsed)}"
+                       f"{f' [{tag}]' if tag else ''}")
+                return 200, data
+            reason = data[:200].decode("utf-8", "replace")
+            gw.usage.record(account=acc.name, model=model, status=status,
+                            latency=time.time() - started, kind="chat",
+                            error=reason, proxy=acc.proxy)
+            gw.pool.report_failure(acc, status, reason, model=model)
+            last = (status, data)
+            if status in self.FATAL_REQUEST:        # not an account problem
+                break
+        if not last[1]:
+            return (503, json.dumps(
+                {"error": {"message": pool_err or "无可用账号 / no usable account",
+                           "type": "account_pool_error", "code": 503}},
+                ensure_ascii=False).encode("utf-8"))
+        return last
+
     def _chat(self) -> None:
         gw = self.gateway
         req = self._read_json()
         model = gw.resolve_model(req.get("model"))
         stream = bool(req.get("stream"))
         skey = session_key(req)                 # 会话粘性键（可能为 None）
+
+        # image 等非 chat 模型打 chat/completions 上游必 404，还会把账号
+        # 打进冷却。这里直接 400 快速失败并指路正确端点（不打上游、不冷却）。
+        _entry = next((m for m in gw.catalogue()
+                       if isinstance(m, dict) and m.get("id") == model), None)
+        if _entry and _entry.get("type") not in (None, "", "chat"):
+            return self._error(
+                400, f"模型 {model} 是 {_entry.get('type')} 类型，"
+                     f"不支持 /v1/chat/completions"
+                     f"（生图请走 /v1/images/generations）",
+                "invalid_request_error")
 
         # 空 messages 直接 400 快速失败：不打上游、不占账号、不冷却。
         # 之前这种请求会打到上游吃 400，再被 report_failure 冷却唯一账号
@@ -1132,11 +1392,13 @@ class Handler(BaseHTTPRequestHandler):
             """调上游（含重试）→ ``(status, body)``，不负责写响应。"""
             tried: list = []
             last: Tuple[int, bytes] = (0, b"")
+            pool_err = ""
             for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
                 try:
                     acc = gw.pool.acquire(exclude=tried, model=model,
                                           session_key_value=skey)
                 except PoolError as exc:
+                    pool_err = str(exc)
                     gw.log(f"[warn] {exc}")
                     break
                 tried.append(acc.name)
@@ -1178,6 +1440,13 @@ class Handler(BaseHTTPRequestHandler):
                            f"（不冷却该账号）")
                 if status in self.FATAL_REQUEST:        # not an account problem
                     break
+            if not last[1]:
+                # 一次上游都没打成（池子空 / 全在冷却 / 模型级冷却）——
+                # 给客户端一个明确的 503，而不是 502 + 空 body。
+                return (503, json.dumps(
+                    {"error": {"message": pool_err or "无可用账号 / no usable account",
+                               "type": "account_pool_error", "code": 503}},
+                    ensure_ascii=False).encode("utf-8"))
             return last
 
         # 长任务（输出上限大）→ chunked + 保活，绕开 Cloudflare 60~100s 504
