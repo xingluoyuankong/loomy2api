@@ -307,21 +307,32 @@ class ModelGateway:
 
     def call(self, session: str, suffix: str, payload: Dict[str, Any],
              extra_headers: Optional[Dict[str, str]] = None,
-             method: str = "POST", proxy: Optional[str] = None) -> Tuple[int, Dict[str, str], bytes]:
+             method: str = "POST", proxy: Optional[str] = None,
+             timeout: Optional[float] = None) -> Tuple[int, Dict[str, str], bytes]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
         return http_request(
             self._url(suffix), method=method, headers=self._headers(session, extra_headers),
-            body=body, timeout=float(self.cfg.get("timeout") or 3600),
+            body=body,
+            # timeout 覆盖：非流式短请求传 request_timeout（默认 120s），
+            # 否则上游卡住时 sock timeout（3600s，每次 read 重置）内整条
+            # 请求挂死、不 failover —— qwenpaw「老是卡死」根因之一。
+            timeout=float(timeout if timeout is not None
+                          else (self.cfg.get("timeout") or 3600)),
             proxy=self._proxy(proxy))
 
     def stream(self, session: str, suffix: str, payload: Dict[str, Any],
                extra_headers: Optional[Dict[str, str]] = None,
-               proxy: Optional[str] = None):
+               proxy: Optional[str] = None,
+               timeout: Optional[float] = None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return open_stream(
             self._url(suffix), method="POST",
             headers=self._headers(session, extra_headers), body=body,
-            timeout=float(self.cfg.get("timeout") or 3600),
+            # sock timeout 沿用到后续每次 resp.read() —— 传
+            # stream_idle_timeout（默认 120s）即「单次 read 无数据 120s 判死」，
+            # 上游流中途卡死/断流不再挂 3600s。
+            timeout=float(timeout if timeout is not None
+                          else (self.cfg.get("timeout") or 3600)),
             proxy=self._proxy(proxy))
 
 

@@ -1024,7 +1024,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 conn, resp = gw.models_client.stream(
                     acc.session, "chat/completions", sreq, extra,
-                    proxy=acc.proxy or None)
+                    proxy=acc.proxy or None,
+                    timeout=float(gw.cfg.get("stream_idle_timeout") or 120))
             except Exception as exc:                    # noqa: BLE001
                 gw.pool.release(acc)
                 gw.log(f"[call] {acc.name} {model} 长任务流式连接异常：{exc}")
@@ -1095,13 +1096,22 @@ class Handler(BaseHTTPRequestHandler):
                                 slot["name"] += fn["name"]
                             if fn.get("arguments"):
                                 slot["args"] += fn["arguments"]
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                # 上游流中断/单次 read 超时（stream_idle_timeout）：之前这里
+                # 没有 except，异常直接炸到外层 502 整单失败不换账号。
+                # 现在记 504 → continue failover 换账号重新聚合。
+                gw.log(f"[call] {acc.name} {model} 长任务流中断/超时：{exc} → 换账号重试")
+                last = (504, json.dumps({"error": {
+                    "message": f"上游流中断/超时（已换账号重试）: {exc}",
+                    "type": "upstream_error", "code": 504}},
+                    ensure_ascii=False).encode("utf-8"))
+                continue
             finally:
                 gw.pool.release(acc)
                 try:
                     conn.close()
                 except Exception:                       # noqa: BLE001
                     pass
-
             elapsed = time.time() - started
             content = "".join(content_parts)
             reasoning = "".join(reason_parts)
@@ -1316,7 +1326,17 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 status, _hdrs, data = gw.models_client.call(
                     acc.session, "chat/completions", chat_req,
-                    proxy=acc.proxy or None)
+                    proxy=acc.proxy or None,
+                    timeout=float(gw.cfg.get("request_timeout") or 120))
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                gw.log(f"[call] {acc.name} {model} 上游超时/连接异常：{exc} → 换账号重试")
+                gw.pool.report_failure(acc, 504, f"上游超时/连接异常 {exc}",
+                                       model=model)
+                last = (504, json.dumps({"error": {
+                    "message": f"上游超时/连接异常: {exc}",
+                    "type": "upstream_error", "code": 504}},
+                    ensure_ascii=False).encode("utf-8"))
+                continue
             finally:
                 gw.pool.release(acc)
             if status == 200:
@@ -1406,7 +1426,21 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     status, _hdrs, data = gw.models_client.call(
                         acc.session, "chat/completions", req, extra,
-                        proxy=acc.proxy or None)
+                        proxy=acc.proxy or None,
+                        timeout=float(gw.cfg.get("request_timeout") or 120))
+                except (TimeoutError, ConnectionError, OSError) as exc:
+                    # 上游超时/连接异常 → 转成 504 走下面既有的失败分支：
+                    # 记账 + report_failure(>=500 只熔断不冷却) + 换账号重试。
+                    # 之前这里直接炸到外层 502，且 sock timeout 是 3600s ——
+                    # 上游 GLM 卡住（实测 0.1 tok/s）时整条请求挂死，
+                    # 客户端只能干等到自己超时（qwenpaw「老是卡死」根因）。
+                    gw.log(f"[call] {acc.name} {model} 上游超时/连接异常："
+                           f"{type(exc).__name__}: {exc} → 换账号重试")
+                    status = 504
+                    data = json.dumps({"error": {
+                        "message": f"上游超时/连接异常: {exc}",
+                        "type": "upstream_error", "code": 504}},
+                        ensure_ascii=False).encode("utf-8")
                 finally:
                     gw.pool.release(acc)
                 if status == 200:
@@ -1487,7 +1521,7 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = []
         conn = resp = None
         acc = None
-
+        first_chunk = b""
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model,
@@ -1499,7 +1533,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 conn, resp = gw.models_client.stream(
                     acc.session, "chat/completions", req, extra,
-                    proxy=acc.proxy or None)
+                    proxy=acc.proxy or None,
+                    timeout=float(gw.cfg.get("stream_idle_timeout") or 120))
             except Exception as exc:                    # noqa: BLE001
                 gw.pool.release(acc)
                 gw.log(f"[call] {acc.name} {model} stream 连接异常：{exc}")
@@ -1508,6 +1543,31 @@ class Handler(BaseHTTPRequestHandler):
                 conn = resp = None
                 continue
             if resp.status == 200:
+                # 首块探测：此刻响应头还没发给客户端，ttfb 卡死/断流可以
+                # 安全 failover 换账号。之前拿到 200 就发头转发，上游卡住时
+                # 客户端只能干等到自己超时（qwenpaw「老是卡死」实锤）。
+                try:
+                    first_chunk = resp.read(4096)
+                except (TimeoutError, ConnectionError, OSError) as exc:
+                    conn.close()
+                    gw.pool.release(acc)
+                    gw.log(f"[call] {acc.name} {model} stream 首字节超时/异常："
+                           f"{type(exc).__name__}: {exc} → 换账号重试")
+                    gw.usage.record(account=acc.name, model=model, status=504,
+                                    kind="chat", error=f"ttfb {exc}",
+                                    stream=True, proxy=acc.proxy)
+                    gw.pool.report_failure(acc, 504, f"stream ttfb: {exc}",
+                                           model=model)
+                    conn = resp = None
+                    continue
+                if not first_chunk:
+                    # 上游秒关空流 → 视同故障换账号
+                    conn.close()
+                    gw.pool.release(acc)
+                    gw.log(f"[call] {acc.name} {model} stream 空流 → 换账号重试")
+                    gw.pool.report_failure(acc, 504, "stream empty", model=model)
+                    conn = resp = None
+                    continue
                 break
             data = resp.read()
             conn.close()
@@ -1551,6 +1611,15 @@ class Handler(BaseHTTPRequestHandler):
 
         usage: Dict[str, Any] = {}
         buffer = b""
+        # 首块已经在上面的探测里读出来了 —— 直接转发给客户端，别丢
+        if first_chunk:
+            first_chunk_at = time.time()
+            self.wfile.write(first_chunk)
+            self.wfile.flush()
+            buffer += first_chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                sse_usage(line.strip(), usage)
         try:
             while True:
                 chunk = resp.read(4096)
@@ -1578,12 +1647,25 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             gw.log(f"[call] {acc.name} {model} client disconnected")
         except Exception as exc:                        # noqa: BLE001
-            # 上游断流 / 读超时等：也要记账，否则失败请求在用量台账里
-            # 凭空消失，排障时看不到这段失败
-            gw.log(f"[call] {acc.name} {model} stream 异常：{exc}")
+            # 上游断流 / 读超时：记账 + 给客户端发**收尾帧**。之前这里直接
+            # 关连接，SSE 没有 [DONE]，客户端 aiohttp 报「对端在未发送完整
+            # 消息体的情况下关闭了连接（分块读取不完整）」（qwenpaw 实锤）。
+            gw.log(f"[call] {acc.name} {model} stream 中断："
+                   f"{type(exc).__name__}: {exc} → 发收尾帧")
             gw.usage.record(account=acc.name, model=model, status=0,
                             latency=time.time() - started, kind="chat",
                             error=str(exc), stream=True, proxy=acc.proxy)
+            try:
+                tail = json.dumps({"error": {
+                    "message": f"上游流中断（{type(exc).__name__}）"
+                               f"/ upstream stream broken: {exc}",
+                    "type": "upstream_error", "code": 504}},
+                    ensure_ascii=False).encode("utf-8")
+                self.wfile.write(b"data: " + tail + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass                                    # 客户端已走，无所谓
         finally:
             gw.pool.release(acc)
             try:
