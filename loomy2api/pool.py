@@ -850,7 +850,8 @@ class AccountPool:
                 self.ensure_session(acc)
                 if acc.session != before:
                     renewed += 1
-                self.refresh_quota(acc)
+                # Patrol light only: heavy totals stay on manual panel refresh.
+                self.refresh_quota_light(acc)
                 refreshed += 1
             except (AccountError, PoolError) as exc:
                 errors.append(f"{acc.name}: {exc}")

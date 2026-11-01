@@ -302,7 +302,7 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
         <table>
           <thead><tr>
             <th>名称</th><th>手机号</th><th>状态</th><th>剩余</th><th>可用积分</th>
-            <th>出口</th><th>请求</th><th>扣分</th><th>设备标识</th><th>操作</th>
+            <th>出口</th><th>请求</th><th>扣分</th><th>设备标识</th><th>邀请</th><th>操作</th>
           </tr></thead>
           <tbody id="rows"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody>
         </table>
@@ -389,6 +389,7 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
       <section>
         <h3>兑换码 <small>redemption codes</small></h3>
         <div class="row">
+          <select id="tRedeemAcc" style="min-width:140px"><option value="">首个可用账号</option></select>
           <input id="tCode" placeholder="输入兑换码" style="min-width:220px">
           <button class="primary" id="tRedeem">兑换</button>
         </div>
@@ -397,15 +398,17 @@ code{background:var(--surface-2);padding:1px 5px;border-radius:4px;border:1px so
       <section>
         <h3>邀请 <small>invite &amp; rewards</small></h3>
         <div class="row">
+          <select id="tInviteAcc" style="min-width:140px"><option value="">首个可用账号</option></select>
           <input id="tInvite" placeholder="绑定他人邀请码" style="min-width:220px">
           <button id="tBindInvite">绑定</button>
         </div>
+        <div class="hint" style="margin-top:8px">不选账号时绑到首个可用账号；账号列表里每行也有「绑定邀请码」按钮，可直接绑到那一行对应的账号。</div>
         <table style="margin-top:10px"><thead><tr><th>邀请码</th><th>已用 / 上限</th><th>状态</th></tr></thead>
         <tbody id="tInviteRows"><tr><td colspan="3" class="empty">—</td></tr></tbody></table>
       </section>
       <section>
         <h3>激活状态 <small>activation</small></h3>
-        <table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody id="tActivationRows"><tr><td colspan="2" class="empty">—</td></tr></tbody></table>
+        <table><thead><tr><th>账号</th><th>激活</th><th>绑定的邀请码</th></tr></thead><tbody id="tActivationRows"><tr><td colspan="3" class="empty">—</td></tr></tbody></table>
       </section>
       <section>
         <h3>账号池状态 <small>pool</small></h3>

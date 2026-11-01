@@ -710,49 +710,66 @@ class Panel:
         """ModelGateway 实例（Panel.gw 是 server.Gateway，真正的上游客户端在 pool）。"""
         return self.gw.pool.gateway
 
+    def _pick_account(self, payload: Optional[Dict[str, Any]] = None):
+        wanted = str(((payload or {}).get('account') or (payload or {}).get('name') or (payload or {}).get('account_name') or '')).strip()
+        accounts = [a for a in self.pool.accounts if a.enabled and a.session]
+        if not accounts:
+            raise PoolError('没有可用账号')
+        if wanted:
+            acc = next((a for a in accounts if a.name == wanted), None)
+            if acc is None:
+                raise PoolError(f'账号不存在或无 session：{wanted}')
+            return acc
+        return accounts[0]
+
     def platform_tasks(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """平台客户端任务聚合：签到 + 激活状态 + 本账号邀请码。"""
-        acc = next((a for a in self.pool.accounts
-                    if a.enabled and a.session), None)
-        if acc is None:
-            raise PoolError("没有可用账号")
+        """平台客户端任务聚合：逐账号签到 + 激活状态 + 各账号邀请码。
+        旧版只取第一个号，其余号的邀请码永远看不到；现逐号循环（签到同款抖动）。
+        顶层 checkin/activation 保留为首个号的结果，供旧前端兼容。"""
+        accounts = [a for a in self.pool.accounts if a.enabled and a.session]
+        if not accounts:
+            raise PoolError('没有可用账号')
         gw = self._gw()
-        out: Dict[str, Any] = {"account": acc.name}
-        try:
-            payload_ = gw.points_first_login(
-                acc.session, proxy=acc.proxy or None,
-                device_id=str((acc.identity or {}).get("campus_device_id") or ""))
-            data = payload_.get("data") or {}
-            out["checkin"] = {
-                "ok": payload_.get("code") == "000000",
-                "already": bool(data.get("alreadyProcessed")),
-                "balance": data.get("currentBalance"),
-                "permanent": data.get("permanentBalance"),
-                "daily": data.get("dailyBalance"),
-                "daily_quota": data.get("dailyQuota"),
-                "daily_consumed": data.get("dailyConsumed"),
-                "cycle": data.get("dailyCycleDate"),
-                "invite_codes": data.get("invitationCodes") or [],
-            }
-        except Exception as exc:                         # noqa: BLE001
-            out["checkin"] = {"ok": False, "error": str(exc)[:200]}
-        try:
-            act = gw.query_activation(acc.session, proxy=acc.proxy or None)
-            out["activation"] = act.get("data") if isinstance(act.get("data"), dict) \
-                else {"raw": act.get("desc") or str(act)[:160]}
-        except Exception as exc:                         # noqa: BLE001
-            out["activation"] = {"error": str(exc)[:200]}
-        return {"ok": True, **out}
+        results = []
+        first = True
+        for acc in accounts:
+            if not first:
+                self._jitter()
+            first = False
+            entry: Dict[str, Any] = {'account': acc.name}
+            try:
+                payload_ = gw.points_first_login(
+                    acc.session, proxy=acc.proxy or None,
+                    device_id=str((acc.identity or {}).get('campus_device_id') or ''))
+                data = payload_.get('data') or {}
+                entry['checkin'] = {
+                    'ok': payload_.get('code') == '000000',
+                    'already': bool(data.get('alreadyProcessed')),
+                    'balance': data.get('currentBalance'),
+                    'permanent': data.get('permanentBalance'),
+                    'daily': data.get('dailyBalance'),
+                    'daily_quota': data.get('dailyQuota'),
+                    'daily_consumed': data.get('dailyConsumed'),
+                    'cycle': data.get('dailyCycleDate'),
+                    'invite_codes': data.get('invitationCodes') or [],
+                }
+            except Exception as exc:
+                entry['checkin'] = {'ok': False, 'error': str(exc)[:200]}
+            try:
+                act = gw.query_activation(acc.session, proxy=acc.proxy or None)
+                entry['activation'] = act.get('data') if isinstance(act.get('data'), dict) else {'raw': act.get('desc') or str(act)[:160]}
+            except Exception as exc:
+                entry['activation'] = {'error': str(exc)[:200]}
+            results.append(entry)
+        out = {'ok': True, 'accounts': results, 'account': results[0]['account'], 'checkin': results[0]['checkin'], 'activation': results[0]['activation']}
+        return out
 
     def redeem(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """兑换积分码（上游 redemption-codes/redeem）。"""
         code = str((payload or {}).get("code") or "").strip()
         if not code:
             raise PoolError("请输入兑换码")
-        acc = next((a for a in self.pool.accounts
-                    if a.enabled and a.session), None)
-        if acc is None:
-            raise PoolError("没有可用账号")
+        acc = self._pick_account(payload)
         result = self._gw().redeem_code(acc.session, code,
                                         proxy=acc.proxy or None)
         ok = result.get("code") == "000000"
@@ -766,24 +783,19 @@ class Panel:
                 "data": result.get("data") or {}, "account": acc.name}
 
     def bind_invite(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """绑定邀请码（上游 points/activation）。"""
-        invite = str((payload or {}).get("invite_code")
-                     or (payload or {}).get("inviteCode") or "").strip()
+        """绑定邀请码（上游 points/activation）。按 payload.account/name 选号，
+        不给则沿用旧行为（第一个可用号），避免旧前端/旧调用方断掉。"""
+        invite = str((payload or {}).get('invite_code') or (payload or {}).get('inviteCode') or '').strip()
         if not invite:
-            raise PoolError("请输入邀请码")
-        acc = next((a for a in self.pool.accounts
-                    if a.enabled and a.session), None)
-        if acc is None:
-            raise PoolError("没有可用账号")
+            raise PoolError('请输入邀请码')
+        acc = self._pick_account(payload)
         result = self._gw().bind_invite_code(
             acc.session, invite,
-            device_id=str((acc.identity or {}).get("campus_device_id") or ""),
+            device_id=str((acc.identity or {}).get('campus_device_id') or ''),
             proxy=acc.proxy or None)
-        ok = result.get("code") == "000000"
-        self.log(f"[panel] 绑定邀请码 {acc.name}: {'成功' if ok else '失败'} "
-                 f"{str(result.get('desc'))[:60]}")
-        return {"ok": ok, "desc": result.get("desc") or "",
-                "data": result.get("data") or {}, "account": acc.name}
+        ok = result.get('code') == '000000'
+        self.log(f"[panel] 绑定邀请码 {acc.name}: {'成功' if ok else '失败'} {str(result.get('desc'))[:60]}")
+        return {'ok': ok, 'desc': result.get('desc') or '', 'data': result.get('data') or {}, 'account': acc.name}
 
     def login_poll(self, state: str) -> Dict[str, Any]:
         view = self.flows.poll_view(state)

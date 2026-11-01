@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 let KEY = localStorage.getItem('loomy2api_key') || '';
 let VIEW = 'accounts';
 let LAST_STATE = null;
+let LAST_TASKS = null;
 
 const TITLES = {
   accounts: ['账号池', 'accounts'],
@@ -244,7 +245,10 @@ function show(view) {
 }
 
 function loadView(view) {
-  if (view === 'accounts') return loadState();
+  if (view === 'accounts') {
+    if (!LAST_TASKS) refreshTasksCache();
+    return loadState();
+  }
   if (view === 'usage') return loadUsage();
   if (view === 'points') return loadPoints(false);
   if (view === 'tasks') return loadJobs();
@@ -317,7 +321,7 @@ function renderState(state) {
     : '无可用账号';
 
   if (!state.accounts.length) {
-    $('rows').innerHTML = '<tr><td colspan="10" class="empty">还没有账号，点右上角「添加账号」</td></tr>';
+    $('rows').innerHTML = '<tr><td colspan="11" class="empty">还没有账号，点右上角「添加账号」</td></tr>';
     return;
   }
   $('rows').innerHTML = state.accounts.map((a) => {
@@ -326,6 +330,18 @@ function renderState(state) {
       : (a.mode === 'session' ? '仅 session' : '手机号+密码');
     const px = a.proxy ? '<span class="mono">' + esc(a.proxy) + '</span>'
       : '<span class="hint">全局/直连</span>';
+    const tk = (LAST_TASKS && LAST_TASKS.accounts || []).find((x) => x.account === a.name);
+    const act = tk ? (tk.activation || {}) : null;
+    const codes = tk ? ((tk.checkin || {}).invite_codes || []) : null;
+    const inviteCell = act === null
+      ? '<span class="hint">未拉取（打开任务页后显示）</span>'
+      : ((act.activated === true
+        ? '<span class="badge b-ok">已绑定</span><div class="hint" style="margin:0">码 ' + esc(act.appliedInvitationCode || '—') + '</div>'
+        : '<span class="badge b-off">未绑定</span>')
+        + '<div class="hint" style="margin:0">自有码 ' + (codes ? codes.length : '—') + ' 个</div>');
+    const bindBtn = (act && act.activated === true)
+      ? '<button disabled title="已绑定 ' + esc(act.appliedInvitationCode || '') + '">已绑定</button>'
+      : '<button onclick="doBindInviteFor(\'' + esc(a.name) + '\', this)">绑定邀请码</button>';
     return '<tr>'
       + '<td><b>' + esc(a.name) + '</b><div class="hint" style="margin:0">' + mode + '</div></td>'
       + '<td class="mono">' + esc(a.loginid_masked || '—') + '</td>'
@@ -337,8 +353,10 @@ function renderState(state) {
       + '<td>' + px + '</td>'
       + '<td>' + nf(a.requests) + '</td><td>' + nf(a.points_used) + '</td>'
       + '<td class="mono" title="' + esc(id.campus_device_id || '') + '">' + esc(id.devid || '—') + '</td>'
+      + '<td>' + inviteCell + '</td>'
       + '<td><div class="row" style="gap:6px">'
       + '<button onclick="act(\'renew\',\'' + esc(a.name) + '\')">续期</button>'
+      + bindBtn
       + '<button onclick="act(\'identity\',\'' + esc(a.name) + '\')">换标识</button>'
       + '<button onclick="act(\'toggle\',\'' + esc(a.name) + '\',' + (!a.enabled) + ')">' + (a.enabled ? '禁用' : '启用') + '</button>'
       + '<button class="danger" onclick="act(\'remove\',\'' + esc(a.name) + '\')">删除</button>'
@@ -801,30 +819,46 @@ async function loadPoints(refresh) {
 async function loadJobs() {
   try {
     const data = await api('/api/panel/tasks');
-    // 签到状态
+    LAST_TASKS = data;
+    // 签到状态（按账号：旧版只显示首个号的余额，容易误以为是全池）
+    const perAcc0 = (data.accounts || []).length ? data.accounts : [{ account: data.account, checkin: data.checkin || {}, activation: data.activation || {} }];
     const ck = data.checkin || {};
-    $('tCheckinInfo').innerHTML = ck.error
-      ? ('<span style="color:var(--bad)">' + esc(ck.error) + '</span>')
-      : ('余额 <b>' + nf(ck.balance) + '</b>（长期 ' + nf(ck.permanent) + ' · 每日 ' +
-         nf(ck.daily) + '/' + nf(ck.daily_quota) + '）· 周期 ' + esc(ck.cycle || '—') +
-         (ck.already ? ' · <span class="badge b-ok">今日已领</span>' : ''));
-    // 邀请码（本账号自己的，邀请别人注册用）
-    const codes = ck.invite_codes || [];
-    $('tInviteRows').innerHTML = codes.length ? codes.map((c) => '<tr>'
-      + '<td class="mono"><b>' + esc(c.inviteCode || '—') + '</b></td>'
-      + '<td>' + nf(c.usedCount) + ' / ' + nf(c.maxUses) + '</td>'
-      + '<td><span class="badge ' + (c.status === 'active' ? 'b-ok' : 'b-off') + '">'
-        + esc(c.status || '—') + '</span></td>'
-      + '</tr>').join('') : '<tr><td colspan="3" class="empty">上游未返回邀请码</td></tr>';
-    // 激活状态
-    const act = data.activation || {};
-    const actRows = act.error
-      ? [['状态', '<span style="color:var(--bad)">' + esc(act.error) + '</span>']]
-      : Object.entries(act).map(([k, v]) => [esc(k), esc(String(v))]);
-    $('tActivationRows').innerHTML = actRows.length
-      ? actRows.map(([k, v]) => '<tr><td class="hint" style="margin:0">' + k
-          + '</td><td><b>' + v + '</b></td></tr>').join('')
-      : '<tr><td colspan="2" class="empty">—</td></tr>';
+    $('tCheckinInfo').innerHTML = perAcc0.map((a) => {
+      const c = a.checkin || {};
+      return '<b>' + esc(a.account) + '</b>：' + (c.error ? ('<span style="color:var(--bad)">' + esc(c.error) + '</span>')
+        : ('余额 <b>' + nf(c.balance) + '</b>（长期 ' + nf(c.permanent) + ' · 每日 ' + nf(c.daily) + '/' + nf(c.daily_quota) + '）· 周期 ' + esc(c.cycle || '—')
+        + (c.already ? ' · <span class="badge b-ok">今日已领</span>' : '')));
+    }).join('<br>');
+    // 邀请码（各账号自己的，邀请别人注册用；旧接口只有首个号，现按账号分组）
+    const perAcc = perAcc0;
+    ['tInviteAcc', 'tRedeemAcc'].forEach((id) => {
+      const sel = $(id);
+      if (sel && perAcc.length) {
+        const cur = sel.value;
+        sel.innerHTML = '<option value="">首个可用账号</option>' + perAcc.map((a) => '<option value="' + esc(a.account) + '">' + esc(a.account) + '</option>').join('');
+        if (perAcc.some((a) => a.account === cur)) sel.value = cur;
+      }
+    });
+    const codeRows = perAcc.map((a) => {
+      const cs = (a.checkin || {}).invite_codes || [];
+      const head = '<tr><td colspan="3"><b>' + esc(a.account) + '</b>' + ((a.checkin || {}).error ? ' <span style="color:var(--bad)">' + esc((a.checkin || {}).error) + '</span>' : '') + '</td></tr>';
+      return head + (cs.length ? cs.map((c) => '<tr>'
+        + '<td class="mono"><b>' + esc(c.inviteCode || '—') + '</b> <button onclick="copyBtnFeedback(this, \'' + esc(c.inviteCode || '') + '\', \'邀请码已复制\')">复制</button></td>'
+        + '<td>' + nf(c.usedCount) + ' / ' + nf(c.maxUses) + '</td>'
+        + '<td><span class="badge ' + (c.status === 'active' ? 'b-ok' : 'b-off') + '">'
+          + esc(c.status || '—') + '</span></td>'
+        + '</tr>').join('') : '<tr><td colspan="3" class="empty">上游未返回邀请码</td></tr>');
+    }).join('');
+    $('tInviteRows').innerHTML = codeRows || '<tr><td colspan="3" class="empty">上游未返回邀请码</td></tr>';
+    // 激活状态（按账号：旧版只显示首个号，7280 已绑后这里仍显示 3147 未绑，误导）
+    $('tActivationRows').innerHTML = perAcc.map((a) => {
+      const act = a.activation || {};
+      if (act.error) return '<tr><td><b>' + esc(a.account) + '</b></td><td colspan="2"><span style="color:var(--bad)">' + esc(act.error) + '</span></td></tr>';
+      const ok = act.activated === true;
+      return '<tr><td><b>' + esc(a.account) + '</b></td>'
+        + '<td><span class="badge ' + (ok ? 'b-ok' : 'b-off') + '">' + (ok ? '已绑定' : '未绑定') + '</span></td>'
+        + '<td class="mono">' + esc(act.appliedInvitationCode || '—') + '</td></tr>';
+    }).join('') || '<tr><td colspan="3" class="empty">—</td></tr>';
     // 账号池状态（沿用）
     const st = LAST_STATE || await api('/api/panel/state');
     const p = st.pool || {};
@@ -887,9 +921,10 @@ async function doRedeem() {
   const btn = $('tRedeem');
   btn.disabled = true; btn.textContent = '兑换中…';
   try {
+    const accSel = $('tRedeemAcc') ? $('tRedeemAcc').value.trim() : '';
     const r = await api('/api/panel/redeem', {
-      method: 'POST', body: JSON.stringify({ code }) });
-    toast((r.ok ? '兑换成功：' : '兑换失败：') + esc(r.desc || ''), r.ok ? 'ok' : 'err');
+      method: 'POST', body: JSON.stringify({ code, account: accSel || undefined }) });
+    toast((r.ok ? '兑换成功（' + esc(r.account || accSel || '首个账号') + '）：' : '兑换失败：') + esc(r.desc || ''), r.ok ? 'ok' : 'err');
     if (r.ok) $('tCode').value = '';
     loadPoints(true);
   } catch (e) { toast('兑换失败：' + e.message, 'err'); }
@@ -902,13 +937,34 @@ async function doBindInvite() {
   const btn = $('tBindInvite');
   btn.disabled = true; btn.textContent = '绑定中…';
   try {
+    const accSel = $('tInviteAcc') ? $('tInviteAcc').value.trim() : '';
     const r = await api('/api/panel/invite', {
-      method: 'POST', body: JSON.stringify({ invite_code: invite }) });
-    toast((r.ok ? '绑定成功：' : '绑定失败：') + esc(r.desc || ''), r.ok ? 'ok' : 'err');
+      method: 'POST', body: JSON.stringify({ invite_code: invite, account: accSel || undefined }) });
+    toast((r.ok ? '绑定成功（' + esc(r.account || accSel || '首个账号') + '）：' : '绑定失败：') + esc(r.desc || ''), r.ok ? 'ok' : 'err');
     if (r.ok) $('tInvite').value = '';
     loadJobs();
   } catch (e) { toast('绑定失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '绑定'; }
+}
+
+async function refreshTasksCache() {
+  try {
+    LAST_TASKS = await api('/api/panel/tasks');
+    if (LAST_STATE) renderState(LAST_STATE);
+  } catch (e) { /* 任务缓存拉不到不影响账号列表本身 */ }
+}
+
+async function doBindInviteFor(name, btn) {
+  const invite = window.prompt('给账号 ' + name + ' 绑定邀请码：');
+  if (!invite || !invite.trim()) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/panel/invite', {
+      method: 'POST', body: JSON.stringify({ invite_code: invite.trim(), account: name }) });
+    toast((r.ok ? '绑定成功（' + (r.account || name) + '）：' : '绑定失败：') + esc(r.desc || ''), r.ok ? 'ok' : 'err');
+    if (r.ok) await refreshTasksCache();
+  } catch (e) { toast('绑定失败：' + e.message, 'err'); }
+  finally { if (btn) btn.disabled = false; }
 }
 
 /* ------------------------------------------------------- 模型与档位 */

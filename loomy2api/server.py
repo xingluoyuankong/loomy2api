@@ -51,6 +51,99 @@ def _rate(usage: Dict[str, Any], elapsed: float) -> str:
     return f" {total / elapsed:.1f}tok/s" if total else ""
 
 
+# ------------------------------------------------------------------ context compress
+# Gateway-side auto-compression, deliberately simple (owner order 2026-10-28:
+# no LLM summarisation call, no extra upstream round trip, no latency on the
+# normal path). Trigger: estimated prompt + reserved output >= 85% of the
+# model's context_length. Action: drop the OLDEST whole conversation blocks
+# until back under 70%, never dropping system messages, never splitting an
+# assistant tool_calls + its tool results, never dropping the last block.
+
+def _msg_text(msg):
+    content = msg.get('content')
+    parts = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                for key in ('text', 'content'):
+                    value = part.get(key)
+                    if isinstance(value, str):
+                        parts.append(value)
+    for call in (msg.get('tool_calls') or []):
+        if isinstance(call, dict):
+            fn = call.get('function') or {}
+            if isinstance(fn.get('name'), str):
+                parts.append(fn['name'])
+            if isinstance(fn.get('arguments'), str):
+                parts.append(fn['arguments'])
+    return ''.join(parts)
+
+def _estimate_tokens(messages, tools):
+    total = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        total += 8
+        text = _msg_text(msg)
+        total += sum(1 for ch in text if ord(ch) > 127)
+        total += sum(1 for ch in text if ord(ch) <= 127) // 4
+    if tools:
+        try:
+            total += len(json.dumps(tools, ensure_ascii=False)) // 4
+        except Exception:
+            pass
+    return total
+
+def _compress_messages(messages, tools, context_length, max_output, threshold=0.85, target=0.70):
+    if not messages or not context_length or context_length <= 0:
+        return messages, None
+    if not (0 < threshold < 1) or not (0 < target < threshold):
+        return messages, None
+    limit = int(context_length * threshold)
+    goal = int(context_length * target)
+    rough = sum(len(_msg_text(m)) for m in messages if isinstance(m, dict))
+    if tools:
+        try:
+            rough += len(json.dumps(tools, ensure_ascii=False)) // 4
+        except Exception:
+            pass
+    if rough + int(max_output or 0) <= limit:
+        return messages, None
+    total = _estimate_tokens(messages, tools) + int(max_output or 0)
+    if total <= limit:
+        return messages, None
+    system = [m for m in messages if isinstance(m, dict) and m.get('role') == 'system']
+    blocks = []
+    current = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get('role') == 'system':
+            continue
+        if m.get('role') == 'user' and current:
+            blocks.append(current)
+            current = [m]
+        elif current:
+            current.append(m)
+        else:
+            current = [m]
+    if current:
+        blocks.append(current)
+    if len(blocks) <= 1:
+        return messages, None
+    kept = list(blocks)
+    while len(kept) > 1:
+        candidate = system + [m for b in kept[1:] for m in b]
+        if _estimate_tokens(candidate, tools) + int(max_output or 0) <= goal:
+            kept = kept[1:]
+            break
+        kept = kept[1:]
+    result = system + [m for b in kept for m in b]
+    if len(result) == len(messages):
+        return messages, None
+    info = {'original_tokens': total, 'compressed_tokens': _estimate_tokens(result, tools) + int(max_output or 0), 'dropped_messages': len(messages) - len(result), 'kept_messages': len(result)}
+    return result, info
+
 def _security_headers(cfg) -> Dict[str, str]:
     """面板/接口的安全响应头（可关）。CSP 只放行内联脚本与同源资源。
 
@@ -289,6 +382,38 @@ class Gateway:
                 self.models = [dict(m, object="model", owned_by="loomy")
                                for m in C.FALLBACK_MODELS]
             return list(self.models)
+
+    def max_output_tokens(self, model: str) -> int:
+        # Upstream catalogue carries a per-model max_output_tokens; use it
+        # as the gateway-wide maximum. Fallback map covers the models seen
+        # in the live catalogue when the catalogue refresh has failed.
+        for entry in self.catalogue():
+            if isinstance(entry, dict) and entry.get("id") == model:
+                v = entry.get("max_output_tokens")
+                if isinstance(v, int) and v > 0:
+                    return v
+        known = {
+            "deepseek-v4-flash-0731": 384000,
+            "DeepSeek-V4.1-Flash": 384000,
+            "MiniMax-M3": 512000,
+            "spark-x2.6": 131072,
+            "spark-x": 65536,
+            "GLM-5.3-Flash": 131072,
+            "qwen3.8-flash": 131072,
+            "qwen-3.8-max": 65536,
+            "Kimi-k2.6": 65536,
+            "mimo-v2.5": 131072,
+        }
+        return known.get(model, 131072)
+
+    def context_length(self, model: str) -> int:
+        for entry in self.catalogue():
+            if isinstance(entry, dict) and entry.get('id') == model:
+                v = entry.get('context_length')
+                if isinstance(v, int) and v > 0:
+                    return v
+        known = {'deepseek-v4-flash-0731': 1048576, 'DeepSeek-V4.1-Flash': 1048576, 'MiniMax-M3': 1048576, 'spark-x2.6': 1048576, 'spark-x': 1048576, 'GLM-5.3-Flash': 1048576, 'qwen3.8-flash': 1000000, 'qwen-3.8-max': 1000000, 'Kimi-k2.6': 262144, 'mimo-v2.5': 1048576}
+        return known.get(model, 1048576)
 
     def resolve_model(self, requested: str) -> str:
         """Model ids are used **verbatim** — there is no alias table.
@@ -1175,20 +1300,70 @@ class Handler(BaseHTTPRequestHandler):
                         content = ""
                     messages.append({"role": item.get("role") or "user",
                                      "content": content})
+                elif itype == "function_call":
+                    _args = item.get("arguments") or ""
+                    if not isinstance(_args, str):
+                        _args = json.dumps(_args, ensure_ascii=False)
+                    messages.append({"role": "assistant", "content": None,
+                                     "tool_calls": [{"id": item.get("call_id") or "",
+                                                     "type": "function",
+                                                     "function": {"name": item.get("name") or "",
+                                                                    "arguments": _args}}]})
                 elif itype == "function_call_output":
+                    _out = item.get("output") or ""
+                    if isinstance(_out, list):
+                        _out = "".join(
+                            (part.get("text") or "") if isinstance(part, dict) else str(part)
+                            for part in _out)
                     messages.append({"role": "tool",
                                      "tool_call_id": item.get("call_id") or "",
-                                     "content": str(item.get("output") or "")})
+                                     "content": str(_out)})
         if not messages:
             return self._error(400, "input 不能为空 / input required",
                                "invalid_request_error")
         chat_req: Dict[str, Any] = {"model": model, "messages": messages}
-        if req.get("max_output_tokens"):
-            chat_req["max_tokens"] = int(req["max_output_tokens"])
+        chat_req["max_tokens"] = gw.max_output_tokens(model)
         for key in ("temperature", "top_p"):
             if req.get(key) is not None:
                 chat_req[key] = req[key]
+        # Responses tools were previously dropped entirely: the upstream
+        # then reasoned "no tools defined" and never emitted tool_calls.
+        # Responses function tools are flat (name/description/parameters),
+        # chat tools are nested under "function".
+        _chat_tools = []
+        for _t in (req.get("tools") or []):
+            if not isinstance(_t, dict):
+                continue
+            if _t.get("type") not in (None, "function"):
+                continue  # built-in tools (web_search etc) have no chat form
+            _fn = _t.get("function") or _t
+            if not _fn.get("name"):
+                continue
+            _chat_tools.append({"type": "function",
+                                "function": {"name": _fn.get("name"),
+                                             "description": _fn.get("description") or "",
+                                             "parameters": _fn.get("parameters") or
+                                             {"type": "object", "properties": {}}}})
+        if _chat_tools:
+            chat_req["tools"] = _chat_tools
+        _tc = req.get("tool_choice")
+        if isinstance(_tc, str):
+            chat_req["tool_choice"] = _tc
+        elif isinstance(_tc, dict):
+            if _tc.get("type") == "function" and _tc.get("name"):
+                chat_req["tool_choice"] = {"type": "function",
+                                           "function": {"name": _tc.get("name")}}
+            elif _tc.get("type") in ("auto", "required", "none"):
+                chat_req["tool_choice"] = _tc["type"]
+        if req.get("parallel_tool_calls") is not None:
+            chat_req["parallel_tool_calls"] = req["parallel_tool_calls"]
+        _reasoning = req.get("reasoning")
+        if isinstance(_reasoning, dict) and _reasoning.get("effort"):
+            chat_req["reasoning_effort"] = _reasoning["effort"]
+        elif req.get("reasoning_effort"):
+            chat_req["reasoning_effort"] = req["reasoning_effort"]
 
+        self._maybe_compress(chat_req, model)
         status, data = self._chat_upstream(chat_req, model, tag="responses")
         if status != 200:
             try:
@@ -1242,6 +1417,16 @@ class Handler(BaseHTTPRequestHandler):
                          "sequence_number": n}):
                 return
             n += 1
+            if item.get("type") == "function_call":
+                if not _evt("response.function_call_arguments.delta",
+                            {"type": "function_call_arguments",
+                             "item_id": item.get("id"),
+                             "output_index": seq.index(item),
+                             "content_index": 0,
+                             "delta": item.get("arguments") or "",
+                             "sequence_number": n}):
+                    return
+                n += 1
             if item.get("type") == "message":
                 for part in item.get("content") or []:
                     if part.get("type") != "output_text":
@@ -1288,11 +1473,20 @@ class Handler(BaseHTTPRequestHandler):
                            "id": "rs_" + uuid.uuid4().hex[:24],
                            "summary": [{"type": "summary_text",
                                         "text": reasoning}]})
-        output.append({"type": "message",
-                       "id": "msg_" + uuid.uuid4().hex[:24],
-                       "status": "completed", "role": "assistant",
-                       "content": [{"type": "output_text",
-                                    "text": content, "annotations": []}]})
+        for _tc in (msg.get("tool_calls") or []):
+            _fn = _tc.get("function") or {}
+            _call_id = _tc.get("id") or "call_" + uuid.uuid4().hex[:24]
+            output.append({"type": "function_call",
+                           "id": _call_id, "call_id": _call_id,
+                           "name": _fn.get("name") or "",
+                           "arguments": _fn.get("arguments") or "",
+                           "status": "completed"})
+        if content:
+            output.append({"type": "message",
+                           "id": "msg_" + uuid.uuid4().hex[:24],
+                           "status": "completed", "role": "assistant",
+                           "content": [{"type": "output_text",
+                                        "text": content, "annotations": []}]})
         return {"id": "resp_" + uuid.uuid4().hex[:24], "object": "response",
                 "created_at": int(time.time()), "status": "completed",
                 "model": model, "output": output,
@@ -1306,6 +1500,18 @@ class Handler(BaseHTTPRequestHandler):
                     "output_tokens_details": {
                         "reasoning_tokens": ctd.get("reasoning_tokens", 0)},
                 }}
+
+    def _maybe_compress(self, req: Dict[str, Any], model: str) -> None:
+        try:
+            msgs = req.get('messages') or []
+            threshold = float(self.gateway.cfg.get('context_compress_threshold') or 0.85)
+            target = float(self.gateway.cfg.get('context_compress_target') or 0.70)
+            new_msgs, info = _compress_messages(msgs, req.get('tools'), self.gateway.context_length(model), int(req.get('max_tokens') or 0), threshold, target)
+            if info is not None:
+                req['messages'] = new_msgs
+                self.gateway.log(f"[compress] {model} ~{info['original_tokens']} tok -> ~{info['compressed_tokens']} tok, dropped {info['dropped_messages']} msgs, kept {info['kept_messages']}")
+        except Exception:
+            pass  # compression must never break a request: fall through unchanged
 
     def _chat_upstream(self, chat_req: Dict[str, Any], model: str,
                        tag: str = "") -> Tuple[int, bytes]:
@@ -1373,6 +1579,22 @@ class Handler(BaseHTTPRequestHandler):
         gw = self.gateway
         req = self._read_json()
         model = gw.resolve_model(req.get("model"))
+        # Owner order 2026-10-28: output cap is always the model maximum.
+        # The gateway previously had NO default at all -- it passed the
+        # client value verbatim, so a client sending 20/120 tokens (or
+        # nothing, letting the upstream pick) truncated thinking models
+        # to an empty answer (finish=length). Explicit client caps are
+        # raised to the model maximum here, by design; the model still
+        # stops naturally, a larger cap does not force longer output.
+        _max_out = gw.max_output_tokens(model)
+        # Long-task keepalive path is decided by the CLIENT's original cap,
+        # not the forced cap: the chunked path sends 200 headers before the
+        # upstream result is known, so it would mask 402/504 statuses for
+        # every short request. Forced cap still applies upstream.
+        _orig_max = int(req.get("max_tokens") or 0)
+        req["max_tokens"] = _max_out
+        if "max_completion_tokens" in req:
+            req["max_completion_tokens"] = _max_out
         stream = bool(req.get("stream"))
         skey = session_key(req)                 # 会话粘性键（可能为 None）
 
@@ -1394,6 +1616,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "messages 不能为空（请求体解析失败或客户端未传）",
                                "invalid_request_error")
 
+        # 显式要求不思考时，上游 chat/completions 并不认 reasoning_effort /
+        # enable_thinking（实测均无效），只认 /no_think 前缀。把标准字段
+        # 翻译成上游认的前缀，避免小 max_tokens 下思考占满预算、正文为空。
+        # 仅在客户端明确要求时改写，不改默认行为、不改重试/冷却规则。
+        _no_think = (
+            str(req.get("reasoning_effort") or "").lower() == "none"
+            or req.get("enable_thinking") is False
+            or (isinstance(req.get("chat_template_kwargs"), dict)
+                and req["chat_template_kwargs"].get("enable_thinking") is False)
+        )
+        if _no_think:
+            for _m in req.get("messages") or []:
+                if (
+                    isinstance(_m, dict)
+                    and _m.get("role") == "user"
+                    and isinstance(_m.get("content"), str)
+                    and not _m["content"].lstrip().startswith("/no_think")
+                ):
+                    _m["content"] = "/no_think " + _m["content"]
+                    break
+
         extra: Dict[str, str] = {}
         for src, dst in (("chat_id", "ChatId"), ("msg_id", "MsgId"),
                          ("turn_id", "TurnId")):
@@ -1404,6 +1647,7 @@ class Handler(BaseHTTPRequestHandler):
         if purpose:
             extra["X-Loomy-Request-Purpose"] = purpose
         req["model"] = model
+        self._maybe_compress(req, model)
 
         if stream:
             return self._chat_stream(req, extra, model, skey)
@@ -1485,7 +1729,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # 长任务（输出上限大）→ chunked + 保活，绕开 Cloudflare 60~100s 504
         min_tok = int(gw.cfg.get("keepalive_min_tokens") or 1500)
-        if int(req.get("max_tokens") or 0) >= min_tok:
+        if _orig_max >= min_tok:
             self._chunked_open()
             try:
                 # 长任务：内部转流式取数（上游非流式 ~60s 就 504），
@@ -1522,6 +1766,8 @@ class Handler(BaseHTTPRequestHandler):
         conn = resp = None
         acc = None
         first_chunk = b""
+        probe_started = time.time()
+        first_chunk_at = None
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model,
@@ -1568,6 +1814,7 @@ class Handler(BaseHTTPRequestHandler):
                     gw.pool.report_failure(acc, 504, "stream empty", model=model)
                     conn = resp = None
                     continue
+                first_chunk_at = time.time()
                 break
             data = resp.read()
             conn.close()
@@ -1598,8 +1845,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(resp.status, data[:500].decode("utf-8", "replace"),
                                    "upstream_error")
 
-        started = time.time()
-        first_chunk_at: Optional[float] = None
+        started = probe_started
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1613,7 +1859,6 @@ class Handler(BaseHTTPRequestHandler):
         buffer = b""
         # 首块已经在上面的探测里读出来了 —— 直接转发给客户端，别丢
         if first_chunk:
-            first_chunk_at = time.time()
             self.wfile.write(first_chunk)
             self.wfile.flush()
             buffer += first_chunk
@@ -1684,14 +1929,17 @@ class Handler(BaseHTTPRequestHandler):
         payload = anth.anthropic_to_openai(req)
         payload["model"] = gw.resolve_model(payload.get("model"))
         model = payload["model"]
+        _orig_max = int(payload.get("max_tokens") or 0)
+        payload["max_tokens"] = gw.max_output_tokens(model)
         skey = session_key(payload)
+        self._maybe_compress(payload, model)
         if req.get("stream"):
             return self._messages_stream(payload, model, skey)
 
         # 长任务：内部转流式取数再聚合（上游非流式 ~60s 就 504），
         # 拿到 OpenAI JSON 后同样走 anthropic 转换，客户端无感。
         min_tok = int(gw.cfg.get("keepalive_min_tokens") or 1500)
-        if int(payload.get("max_tokens") or 0) >= min_tok:
+        if _orig_max >= min_tok:
             self._chunked_open()
             try:
                 res = self._run_with_keepalive(
@@ -1774,6 +2022,7 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = []
         conn = resp = None
         acc = None
+        started = time.time()
 
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
@@ -1824,7 +2073,6 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "api_error", "message": data[:500].decode("utf-8", "replace")}})
 
         translator = anth.StreamTranslator(model)
-        started = time.time()
         first_chunk_at: Optional[float] = None
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")

@@ -52,6 +52,11 @@ DEFAULTS: Dict[str, Any] = {
     # 非流式请求 max_tokens ≥ 此值 → 启用 chunked 保活（每 15s 写一个
     # JSON 合法前导空白），绕开 Cloudflare 免费版 60~100s 的 504。
     "keepalive_min_tokens": 1500,
+    # Auto context compression (simple, deterministic, no LLM call):
+    # estimated prompt + reserved output >= threshold * context_length
+    # drops oldest whole blocks until under target * context_length.
+    "context_compress_threshold": 0.85,
+    "context_compress_target": 0.70,
     "cooldown_seconds": 300,      # 兜底冷却（未分类错误）
     # 有密码的账号：session 役龄达到该天数就主动重登换新（赶在上游拒绝前，
     # 不中断服务）。若某账号实测过真实寿命（observed_lifetime），阈值自动
