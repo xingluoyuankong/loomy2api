@@ -268,6 +268,7 @@ class Gateway:
         self.panel = Panel(self)
         self.models: list = []
         self._models_lock = threading.Lock()
+        self._models_from_upstream = False
         #: 请求级用量台账（面板「用量」页）
         self.usage = UsageLedger(
             int(cfg.get("usage_max_entries") or 500),
@@ -282,6 +283,8 @@ class Gateway:
             acc = self.pool.acquire()
             payload = self.models_client.models(acc.session)
             data = payload.get("data") or []
+            if not data:
+                raise ValueError("Upstream model catalogue is empty")
             for m in data:
                 if isinstance(m, dict) and (m.get("multiplier") in (None, "", 0)):
                     mm = re.search(r"(?:x|×)([0-9]+(?:\.[0-9]+)?)",
@@ -290,6 +293,7 @@ class Gateway:
                         m["multiplier"] = float(mm.group(1))
             with self._models_lock:
                 self.models = data
+                self._models_from_upstream = True
             self.log(f"上游模型列表已刷新：{len(data)} 个")
         except Exception as exc:                        # noqa: BLE001
             with self._models_lock:
@@ -311,6 +315,7 @@ class Gateway:
         之前只在启动时拉一次，7 天不更新用户都发现不了
         （2026-10-13 实锤：10-06 到 10-13 零刷新）。
         默认 24 小时，可配 ``models_refresh_hours``（最少 1 小时）。
+        尚未取得上游目录时每 60 秒重试，避免空账号启动后一直显示备用清单。
         """
         if getattr(self, "_models_thread", None) \
                 and self._models_thread.is_alive():
@@ -321,8 +326,11 @@ class Gateway:
         self._models_stop = stop
 
         def _loop() -> None:
-            # 启动时 start() 已经刷过一次，这里先睡满一个周期
-            while not stop.wait(interval):
+            while True:
+                with self._models_lock:
+                    delay = interval if self._models_from_upstream else 60
+                if stop.wait(delay):
+                    break
                 try:
                     self.refresh_models()
                 except Exception as exc:                # noqa: BLE001
@@ -331,7 +339,8 @@ class Gateway:
         t = threading.Thread(target=_loop, name="models-refresher", daemon=True)
         t.start()
         self._models_thread = t
-        self.log(f"模型列表定时刷新已启动（每 {interval / 3600:.1f} 小时）")
+        self.log(f"模型列表定时刷新已启动（每 {interval / 3600:.1f} 小时；"
+                 "上游目录未就绪时每 60 秒重试）")
 
     def start_daily_checkin(self) -> None:
         """后台线程：每日自动签到（领每日积分）。
