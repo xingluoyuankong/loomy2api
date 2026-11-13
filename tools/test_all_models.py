@@ -14,7 +14,7 @@ d = json.load(open('accounts.json', encoding='utf-8'))
 accs = d['accounts'] if isinstance(d, dict) and 'accounts' in d else d
 sess, proxy = accs[0]['session'], (accs[0].get('proxy') or None)
 
-CHAT = ['deepseek-v4-flash-1017', 'DeepSeek-V4.1-Flash',
+CHAT = ['deepseek-v4.1-flash-1017', 'deepseek-v4-flash-1017', 'deepseek-v4.1-flash',
         'GLM-5.3-Flash', 'qwen3.8-flash', 'spark-x2.6', 'mimo-v2.5']
 IMAGES = ['Hy-Image-3.5-preview', 'doubao-seedream-5-lite', 'qwen-image-3.0-pro']
 BUDGET = {}

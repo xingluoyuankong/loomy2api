@@ -390,15 +390,17 @@ class Gateway:
         self.log("每日自动签到已启动（每天 UTC 00:30 后执行）")
 
     def catalogue(self) -> list:
-        # Downstream model id is lowercase: upstream DeepSeek-V4.1-Flash
-        # is shown as deepseek-v4.1-flash in the outward catalogue.
-        # Upstream requests still use the capitalised id (see
-        # resolve_model); translating here on every call keeps a later
-        # upstream refresh from reverting the outward id to capitals.
+        # Downstream model ids are the official ones, not the upstream API's
+        # abbreviations: upstream DeepSeek-V4.1-Flash is shown as
+        # deepseek-v4.1-flash, and upstream deepseek-v4-flash-1017 is shown as
+        # deepseek-v4.1-flash-1017 (the official DeepSeek id; the 1017 snapshot
+        # belongs to V4.1, not V4). Upstream requests still use the upstream ids
+        # (see resolve_model); translating here on every call keeps a later
+        # upstream refresh from reverting the outward ids.
         # Same treatment for C.MODEL_FIELD_OVERRIDES: fields the upstream
-        # itself gets wrong (1017 display name, spark-x2.6 multiplier) are
-        # corrected here so /v1/models and the panel can never show the
-        # wrong value, whatever a refresh returned.
+        # itself gets wrong (spark-x2.6 multiplier) are corrected here so
+        # /v1/models and the panel can never show the wrong value, whatever
+        # a refresh returned.
         with self._models_lock:
             if not self.models:
                 self.models = [dict(m, object="model", owned_by="loomy")
@@ -408,6 +410,8 @@ class Gateway:
                 if isinstance(m, dict):
                     if m.get("id") == "DeepSeek-V4.1-Flash":
                         m = dict(m, id="deepseek-v4.1-flash")
+                    if m.get("id") == "deepseek-v4-flash-1017":
+                        m = dict(m, id="deepseek-v4.1-flash-1017")
                     override = C.MODEL_FIELD_OVERRIDES.get(m.get("id") or "")
                     if override:
                         m = dict(m, **override)
@@ -424,6 +428,7 @@ class Gateway:
                 if isinstance(v, int) and v > 0:
                     return v
         known = {
+            "deepseek-v4.1-flash-1017": 384000,
             "deepseek-v4-flash-1017": 384000,
             "DeepSeek-V4.1-Flash": 384000,
             "deepseek-v4.1-flash": 384000,
@@ -440,11 +445,11 @@ class Gateway:
                 v = entry.get('context_length')
                 if isinstance(v, int) and v > 0:
                     return v
-        known = {'deepseek-v4-flash-1017': 1048576, 'DeepSeek-V4.1-Flash': 1048576, 'deepseek-v4.1-flash': 1048576, 'spark-x2.6': 1048576, 'GLM-5.3-Flash': 1048576, 'qwen3.8-flash': 1000000, 'mimo-v2.5': 1024000}
+        known = {'deepseek-v4.1-flash-1017': 1048576, 'deepseek-v4-flash-1017': 1048576, 'DeepSeek-V4.1-Flash': 1048576, 'deepseek-v4.1-flash': 1048576, 'spark-x2.6': 1048576, 'GLM-5.3-Flash': 1048576, 'qwen3.8-flash': 1000000, 'mimo-v2.5': 1024000}
         return known.get(model, 1048576)
 
     def resolve_model(self, requested: str) -> str:
-        """Model ids are used **verbatim**, with one alias exception.
+        """Model ids are used **verbatim**, with two alias exceptions.
 
         Only the provider prefix is stripped (``imodel/deepseek-…`` →
         ``deepseek-…``), because several clients insist on writing it. Note that
@@ -454,18 +459,31 @@ class Gateway:
         request for it now also lands on ``spark-x2.6``), so a typo degrades
         instead of erroring — always check the ``model`` field of the response.
 
-        Exception: downstream ``deepseek-v4.1-flash`` (lowercase, as shown
-        in the outward catalogue) is translated to upstream
-        ``DeepSeek-V4.1-Flash``. Sending the lowercase id upstream would
-        silently fall back to the default model, so it must not pass
-        through verbatim.
+        Aliases (downstream official id → upstream API id):
+        - ``deepseek-v4.1-flash`` → ``DeepSeek-V4.1-Flash`` (outward catalogue
+          shows the lowercase id; sending it upstream would silently fall back).
+        - ``deepseek-v4.1-flash-1017`` → ``deepseek-v4-flash-1017``: the official
+          DeepSeek id for the 2026-10-17 V4.1 Flash snapshot. Loomy's upstream
+          API abbreviates it to ``deepseek-v4-flash-1017`` (its display name still
+          says V4.1), so the official id must be translated on the way in —
+          without this, asking for ``deepseek-v4.1-flash-1017`` silently serves
+          ``spark-x2.6`` (measured 2026-11-14). The abbreviated id still passes
+          through unchanged for clients that already use it.
         """
         name = str(requested or "").strip()
         if self.cfg.get("strip_model_prefix", True) and "/" in name:
             name = name.split("/", 1)[1].strip()
+        if not name:
+            # Default goes through the same alias translation below: the
+            # configured default is the outward (official) id, but upstream
+            # must receive the upstream id — returning it untranslated would
+            # silently serve the upstream default (spark-x2.6).
+            name = str(self.cfg.get("default_model") or C.DEFAULT_MODEL)
         if name == "deepseek-v4.1-flash":
             name = "DeepSeek-V4.1-Flash"
-        return name or str(self.cfg.get("default_model") or C.DEFAULT_MODEL)
+        if name == "deepseek-v4.1-flash-1017":
+            name = "deepseek-v4-flash-1017"
+        return name
 
     # -- background ------------------------------------------------------
 
@@ -1674,7 +1692,7 @@ class Handler(BaseHTTPRequestHandler):
         # image 等非 chat 模型打 chat/completions 上游必 404，还会把账号
         # 打进冷却。这里直接 400 快速失败并指路正确端点（不打上游、不冷却）。
         _entry = next((m for m in gw.catalogue()
-                       if isinstance(m, dict) and (m.get("id") == model or (model == "DeepSeek-V4.1-Flash" and m.get("id") == "deepseek-v4.1-flash"))), None)
+                       if isinstance(m, dict) and (m.get("id") == model or (model == "DeepSeek-V4.1-Flash" and m.get("id") == "deepseek-v4.1-flash") or (model == "deepseek-v4-flash-1017" and m.get("id") == "deepseek-v4.1-flash-1017"))), None)
         if _entry and _entry.get("type") not in (None, "", "chat"):
             return self._error(
                 400, f"模型 {model} 是 {_entry.get('type')} 类型，"

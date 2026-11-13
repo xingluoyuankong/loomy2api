@@ -19,8 +19,8 @@
   "_api_keys": "empty list = the gateway needs no key. Set e.g. [\"sk-abc\"] to require Bearer/x-api-key. 首启自动生成时这里会是随机 Key。",
   "api_keys": [],
 
-  "default_model": "deepseek-v4-flash-1017",
-  "_models": "Upstream model ids are used verbatim — no alias table. See GET /v1/models for the catalogue.",
+  "default_model": "deepseek-v4.1-flash-1017",
+  "_models": "Outward ids are the official ones; the gateway translates the two DeepSeek aliases (deepseek-v4.1-flash, deepseek-v4.1-flash-1017) to the upstream ids. See GET /v1/models for the catalogue.",
 
   "timeout": 1200,
   "request_purpose": "chat.message",

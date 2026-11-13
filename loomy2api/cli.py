@@ -246,7 +246,9 @@ def cmd_chat(cfg, args) -> int:
     client = ModelGateway(cfg)
     acc = pool.acquire()
     payload = {
-        "model": args.model or cfg.get("default_model") or C.DEFAULT_MODEL,
+        # CLI 直调上游，不走 resolve_model 的请求路径：这里必须先翻回上游 id，
+        # 否则默认模型（对外官方 id deepseek-v4.1-flash-1017）会静默回落到 spark-x2.6。
+        "model": client.resolve_model(args.model or cfg.get("default_model") or C.DEFAULT_MODEL),
         "messages": [{"role": "user", "content": args.prompt}],
         "stream": False,
     }

@@ -95,15 +95,18 @@ REQUEST_PURPOSES = (
 #: Fallback catalogue, used when the upstream /models call fails.
 #: ``multiplier`` is the points-per-request cost factor reported by the client.
 #: 2026-11-14 上游实测快照（10 个）：0731 / MiniMax-M3 / Kimi-k2.6 / qwen-3.8-max /
-#: spark-x 均已下线；新增 DeepSeek-V4.1-Flash、deepseek-v4-flash-1017、spark-x2.6、auto。
-#: 注意 deepseek-v4-flash-1017 的上游名字写的是 "DeepSeek V4.1 Flash 1017"，但它的 id
-#: 是 v4 日期快照线（0731 的后继），不是 V4.1——见 MODEL_FIELD_OVERRIDES。
+#: spark-x 均已下线；新增 DeepSeek-V4.1-Flash、1017、spark-x2.6、auto。
+#: 注意 1017 的 id：上游 API 返回的是省略了 ".1" 的 ``deepseek-v4-flash-1017``，
+#: 但 DeepSeek 官方发布的模型就是 DeepSeek-V4.1-Flash-1017（2026-10-17 快照，
+#: V4.1 Flash 的小更新，552B，1M 上下文；V4 那条线的快照是 0731，284B）。
+#: 上游自己的名字 "DeepSeek V4.1 Flash 1017" 是对的。网关对外用官方 id
+#: ``deepseek-v4.1-flash-1017``（见 catalogue() 的翻译），请求时再翻回上游 id。
 FALLBACK_MODELS = (
     {"id": "spark-x2.6", "name": "Spark-X2.6 正式版(限时免费)(x0.0)", "multiplier": 0.0,
      "context_length": 1048576, "modalities": ["text"]},
     {"id": "DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash(x2.0)", "multiplier": 2.0,
      "context_length": 1048576, "modalities": ["text", "image"]},
-    {"id": "deepseek-v4-flash-1017", "name": "DeepSeek V4 Flash 1017(x2.0)",
+    {"id": "deepseek-v4.1-flash-1017", "name": "DeepSeek V4.1 Flash 1017(x2.0)",
      "multiplier": 2.0, "context_length": 1048576, "modalities": ["text", "image"]},
     {"id": "GLM-5.3-Flash", "name": "GLM 5.3 Flash(x0.8)", "multiplier": 0.8,
      "context_length": 1048576, "modalities": ["text", "image", "video"]},
@@ -125,19 +128,16 @@ FALLBACK_MODELS = (
 #: :meth:`Gateway.catalogue` (the single outward path for /v1/models and the
 #: panel). Only fields the upstream itself gets wrong:
 #:
-#: - ``deepseek-v4-flash-1017``: upstream names it "DeepSeek V4.1 Flash 1017",
-#:   but the id is the v4 dated-snapshot line (successor of deepseek-v4-flash-0731);
-#:   the real V4.1 model has the undated id ``DeepSeek-V4.1-Flash``. The display
-#:   name is corrected to V4 so the two DeepSeek entries are distinguishable.
 #: - ``spark-x2.6``: upstream name ends "(x0.0)" (free for now) but starts with
 #:   "Spark-X2.6", so a first-match multiplier parse reads 2.6. The multiplier
 #:   is pinned to 0.0 here as well as fixed at parse time in refresh_models.
+#: （1017 不在这里：它的名字上游写对了，错的是 id 省略了 ".1"——那个翻译在
+#: catalogue() 里做，和 DeepSeek-V4.1-Flash 的小写翻译同一处。）
 MODEL_FIELD_OVERRIDES = {
-    "deepseek-v4-flash-1017": {"name": "DeepSeek V4 Flash 1017(x2.0)"},
     "spark-x2.6": {"multiplier": 0.0},
 }
 
-DEFAULT_MODEL = "deepseek-v4-flash-1017"
+DEFAULT_MODEL = "deepseek-v4.1-flash-1017"
 
 #: Minimum AES-GCM tag / iv / salt sizes from the client's crypto module.
 SALT_LEN, IV_LEN, TAG_LEN, KEY_LEN = 16, 12, 16, 32

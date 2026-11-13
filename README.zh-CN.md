@@ -177,7 +177,7 @@ python -m loomy2api serve                 # http://127.0.0.1:17890
 ```bash
 curl http://127.0.0.1:17890/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model": "deepseek-v4-flash-1017",
+  -d '{"model": "deepseek-v4.1-flash-1017",
        "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
@@ -186,7 +186,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:17890/v1", api_key="随便填")
 print(client.chat.completions.create(
-    model="deepseek-v4-flash-1017",            # 见 GET /v1/models
+    model="deepseek-v4.1-flash-1017",            # 见 GET /v1/models
     messages=[{"role": "user", "content": "你好"}],
 ).choices[0].message.content)
 ```
@@ -360,16 +360,18 @@ Key 存在浏览器 localStorage 里。
 | `spark-x2.6` | x0.0 | Spark X2.6 正式版，限时免费，文本 + 推理 |
 | `GLM-5.3-Flash` | x0.8 | 视觉 / 视频 / 工具 |
 | `qwen3.8-flash` | x0.8 | 视觉 / 视频 / 工具 |
-| `deepseek-v4-flash-1017` | x2.0 | DeepSeek V4 Flash 1017，1M 上下文，支持工具 |
-| `DeepSeek-V4.1-Flash` | x2.0 | DeepSeek V4.1 Flash，1M 上下文，支持工具 |
+| `deepseek-v4.1-flash-1017` | x2.0 | DeepSeek V4.1 Flash 1017，1M 上下文，支持工具 |
+| `deepseek-v4.1-flash` | x2.0 | DeepSeek V4.1 Flash，1M 上下文，支持工具 |
 | `mimo-v2.5` | x3.3 | 音频 / 图像 / 视频 |
 | `Hy-Image-3.5-preview`、`doubao-seedream-5-lite`、`qwen-image-3.0-pro` | — | 生图 |
 | `auto` | — | 自动 · 均衡（上游自动选模型） |
 
-注意：上游把 `deepseek-v4-flash-1017` 的名字写成了 "DeepSeek V4.1 Flash 1017"，但它的 id
-是 v4 日期快照线（0731 的后继），真正的 V4.1 是另一个 id `DeepSeek-V4.1-Flash`——网关在
-`/v1/models` 与面板里把 1017 的显示名纠正为 "DeepSeek V4 Flash 1017"，免得两个 DeepSeek
-分不清；另见 `loomy2api/constants.py` 里的 `MODEL_FIELD_OVERRIDES`。
+注意 1017 的 id 有两套写法：DeepSeek 官方的 id 是 `deepseek-v4.1-flash-1017`
+（2026-10-17 发布的 V4.1 Flash 快照，552B；V4 那条线的快照是 0731，284B），
+Loomy 上游 API 里把它简写成 `deepseek-v4-flash-1017`（名字仍写 V4.1）。网关对外
+（`/v1/models`、面板）用官方 id `deepseek-v4.1-flash-1017`，收到请求时再翻回上游
+简写 id；直接写简写 id 也能调通。另见 `loomy2api/constants.py` 与
+`Gateway.resolve_model` 里的别名注释。
 
 ## 配置
 
@@ -546,8 +548,9 @@ docker compose logs -f
 | Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:17890`、`ANTHROPIC_API_KEY=<随便>` |
 | curl | 见上面「快速开始」 |
 
-模型名直接用上游 id（见 `/v1/models`，比如 `deepseek-v4-flash-1017`、`spark-x2.6`、`DeepSeek-V4.1-Flash`）。
-除上面写明的两处显示纠正外（小写 `deepseek-v4.1-flash`、1017 的显示名），名字原样转发
+模型名用 `/v1/models` 里列出的官方 id（比如 `deepseek-v4.1-flash-1017`、`spark-x2.6`、
+`deepseek-v4.1-flash`）。除上面写明的两处显示翻译外（`DeepSeek-V4.1-Flash` 对外显示为小写
+`deepseek-v4.1-flash`、1017 对外显示官方 id），名字原样转发
 （只剥掉 `provider/` 前缀）；注意上游自己对不认识的模型名会
 静默回落到默认模型，所以怀疑没生效时看回包的 `model` 字段。
 

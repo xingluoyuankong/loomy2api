@@ -149,8 +149,9 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertEqual(payload["usage"]["points_consumed"], 1)
 
     def test_model_name_is_passed_through_verbatim(self):
-        """No alias table: an unknown name goes upstream as-is (so a typo is a
-        400 from the upstream, not a silent redirect to another model)."""
+        """Unknown names go upstream as-is, apart from the two documented
+        DeepSeek aliases in resolve_model (deepseek-v4.1-flash,
+        deepseek-v4.1-flash-1017)."""
         _s, body, _ = self.post("/v1/chat/completions", {
             "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(json.loads(body)["model"], "gpt-4o-mini")
@@ -158,7 +159,11 @@ class GatewayTestCase(_Harness, unittest.TestCase):
     def test_missing_model_falls_back_to_default(self):
         _s, body, _ = self.post("/v1/chat/completions", {
             "messages": [{"role": "user", "content": "x"}]})
-        self.assertEqual(json.loads(body)["model"], self.cfg["default_model"])
+        # The configured default is the outward (official) id; the response
+        # echoes the id actually sent upstream, i.e. the resolved alias.
+        self.assertEqual(self.cfg["default_model"], "deepseek-v4.1-flash-1017")
+        self.assertEqual(json.loads(body)["model"],
+                         self.gateway.resolve_model(self.cfg["default_model"]))
 
     def test_chat_stream(self):
         _s, body, _ = self.post("/v1/chat/completions", {
