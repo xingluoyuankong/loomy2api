@@ -13,9 +13,9 @@
 
 ```
 GET https://loomy.xunfei.cn/api/download?platform=windows&variant=secondary
-  → 302 https://static-res.xfinfr.com/loomy/win/Loomy-0.9.38-win.zip   (553 MB)
+  → 302 https://static-res.xfinfr.com/loomy/win/Loomy-0.9.39-win.zip   (553 MB)
 GET https://loomy.xunfei.cn/api/download?platform=windows
-  → 302 https://static-res.xfinfr.com/loomy/win/Loomy-Setup-0.9.38.exe (444 MB)
+  → 302 https://static-res.xfinfr.com/loomy/win/Loomy-Setup-0.9.39.exe (444 MB)
 ```
 
 ZIP 支持 Range，所以**只取需要的文件**，不整包下载

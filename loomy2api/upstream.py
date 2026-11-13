@@ -313,9 +313,10 @@ class ModelGateway:
         return http_request(
             self._url(suffix), method=method, headers=self._headers(session, extra_headers),
             body=body,
-            # timeout 覆盖：非流式短请求传 request_timeout（默认 120s），
-            # 否则上游卡住时 sock timeout（3600s，每次 read 重置）内整条
-            # 请求挂死、不 failover —— qwenpaw「老是卡死」根因之一。
+            # 默认保持 3600s：非流式是单次回包，sock timeout 就是总时长，
+            # 改默认等于给所有没传超时的调用方加总时限——那是新增限制，
+            # 不许顺手加。需要短时限的调用方显式传（聊天 core 已传
+            # request_timeout 120s；生图与 _messages 非流式显式传 3600）。
             timeout=float(timeout if timeout is not None
                           else (self.cfg.get("timeout") or 3600)),
             proxy=self._proxy(proxy))
@@ -328,11 +329,12 @@ class ModelGateway:
         return open_stream(
             self._url(suffix), method="POST",
             headers=self._headers(session, extra_headers), body=body,
-            # sock timeout 沿用到后续每次 resp.read() —— 传
-            # stream_idle_timeout（默认 120s）即「单次 read 无数据 120s 判死」，
-            # 上游流中途卡死/断流不再挂 3600s。
+            # sock timeout 沿用到后续每次 resp.read() —— 默认
+            # stream_idle_timeout（120s）即「单次 read 无数据 120s 判死」，
+            # 上游流中途卡死/断流不再挂 3600s；数据持续流动时总时长不限，
+            # 长任务不受影响。之前默认 3600s。
             timeout=float(timeout if timeout is not None
-                          else (self.cfg.get("timeout") or 3600)),
+                          else (self.cfg.get("stream_idle_timeout") or 120)),
             proxy=self._proxy(proxy))
 
 

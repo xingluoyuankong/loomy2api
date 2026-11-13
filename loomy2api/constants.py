@@ -30,7 +30,9 @@ DEFAULT_ACCESS_KEY_ID = "2thryby66wxi53sk"
 DEFAULT_ACCESS_KEY_SECRET = "zsak6eadrbawz683wf5r3m2snrwj868r"
 
 #: Sent as the ``loomy-version`` header; the gateway only checks it is present.
-DEFAULT_LOOMY_VERSION = "0.9.38"
+#: 2026-11-14 实测：官方 CDN 已有 0.9.39（Loomy-0.9.39-win.zip / Loomy-Setup-0.9.39.exe
+#: 均 200），0.9.40 还是 404，最新就是 0.9.39。
+DEFAULT_LOOMY_VERSION = "0.9.39"
 
 #: Passphrase used by the client to obfuscate ``resources/.env.prod``
 #: (hard-coded in ``electron/utils/env-file-crypto.js`` of the client).
@@ -92,32 +94,50 @@ REQUEST_PURPOSES = (
 
 #: Fallback catalogue, used when the upstream /models call fails.
 #: ``multiplier`` is the points-per-request cost factor reported by the client.
+#: 2026-11-14 上游实测快照（10 个）：0731 / MiniMax-M3 / Kimi-k2.6 / qwen-3.8-max /
+#: spark-x 均已下线；新增 DeepSeek-V4.1-Flash、deepseek-v4-flash-1017、spark-x2.6、auto。
+#: 注意 deepseek-v4-flash-1017 的上游名字写的是 "DeepSeek V4.1 Flash 1017"，但它的 id
+#: 是 v4 日期快照线（0731 的后继），不是 V4.1——见 MODEL_FIELD_OVERRIDES。
 FALLBACK_MODELS = (
-    {"id": "spark-x", "name": "Spark X2.5 (x0.1)", "multiplier": 0.1,
+    {"id": "spark-x2.6", "name": "Spark-X2.6 正式版(限时免费)(x0.0)", "multiplier": 0.0,
      "context_length": 1048576, "modalities": ["text"]},
-    {"id": "GLM-5.3-Flash", "name": "GLM 5.3 Flash (x0.8)", "multiplier": 0.8,
+    {"id": "DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash(x2.0)", "multiplier": 2.0,
+     "context_length": 1048576, "modalities": ["text", "image"]},
+    {"id": "deepseek-v4-flash-1017", "name": "DeepSeek V4 Flash 1017(x2.0)",
+     "multiplier": 2.0, "context_length": 1048576, "modalities": ["text", "image"]},
+    {"id": "GLM-5.3-Flash", "name": "GLM 5.3 Flash(x0.8)", "multiplier": 0.8,
      "context_length": 1048576, "modalities": ["text", "image", "video"]},
-    {"id": "qwen3.8-flash", "name": "qwen 3.8 flash (x0.8)", "multiplier": 0.8,
+    {"id": "qwen3.8-flash", "name": "qwen 3.8 flash（x0.8）", "multiplier": 0.8,
      "context_length": 1000000, "modalities": ["text", "image", "video"]},
-    {"id": "deepseek-v4-flash-0731", "name": "DeepSeek V4 Flash 0731 (x3.0)",
-     "multiplier": 3.0, "context_length": 1048576, "modalities": ["text"]},
-    {"id": "mimo-v2.5", "name": "MiMo V2.5 (x3.3)", "multiplier": 3.3,
-     "context_length": 1048576, "modalities": ["text", "image", "audio", "video"]},
-    {"id": "MiniMax-M3", "name": "MiniMax M3 (x4.0)", "multiplier": 4.0,
-     "context_length": 1048576, "modalities": ["text", "image", "video"]},
-    {"id": "Kimi-k2.6", "name": "Kimi k2.6 (x6.5)", "multiplier": 6.5,
-     "context_length": 262144, "modalities": ["text", "image", "video"]},
-    {"id": "qwen-3.8-max", "name": "Qwen 3.8 Max (x12.0)", "multiplier": 12.0,
-     "context_length": 1000000, "modalities": ["text"]},
     {"id": "Hy-Image-3.5-preview", "name": "Hy image 3.5 preview",
      "multiplier": 0.0, "context_length": 100000, "modalities": ["text", "image"]},
     {"id": "doubao-seedream-5-lite", "name": "Doubao seedream 5 lite",
      "multiplier": 0.0, "context_length": 128000, "modalities": ["text", "image"]},
     {"id": "qwen-image-3.0-pro", "name": "qwen image 3.0 pro",
      "multiplier": 0.0, "context_length": 0, "modalities": ["text", "image"]},
+    {"id": "mimo-v2.5", "name": "MiMo V2.5（x3.3）", "multiplier": 3.3,
+     "context_length": 1024000, "modalities": ["text", "image", "audio", "video"]},
+    {"id": "auto", "name": "自动 · 均衡", "multiplier": None,
+     "context_length": 0, "modalities": ["text"]},
 )
 
-DEFAULT_MODEL = "deepseek-v4-flash-0731"
+#: Display corrections applied to the live upstream catalogue in
+#: :meth:`Gateway.catalogue` (the single outward path for /v1/models and the
+#: panel). Only fields the upstream itself gets wrong:
+#:
+#: - ``deepseek-v4-flash-1017``: upstream names it "DeepSeek V4.1 Flash 1017",
+#:   but the id is the v4 dated-snapshot line (successor of deepseek-v4-flash-0731);
+#:   the real V4.1 model has the undated id ``DeepSeek-V4.1-Flash``. The display
+#:   name is corrected to V4 so the two DeepSeek entries are distinguishable.
+#: - ``spark-x2.6``: upstream name ends "(x0.0)" (free for now) but starts with
+#:   "Spark-X2.6", so a first-match multiplier parse reads 2.6. The multiplier
+#:   is pinned to 0.0 here as well as fixed at parse time in refresh_models.
+MODEL_FIELD_OVERRIDES = {
+    "deepseek-v4-flash-1017": {"name": "DeepSeek V4 Flash 1017(x2.0)"},
+    "spark-x2.6": {"multiplier": 0.0},
+}
+
+DEFAULT_MODEL = "deepseek-v4-flash-1017"
 
 #: Minimum AES-GCM tag / iv / salt sizes from the client's crypto module.
 SALT_LEN, IV_LEN, TAG_LEN, KEY_LEN = 16, 12, 16, 32

@@ -43,7 +43,7 @@ DEFAULTS: Dict[str, Any] = {
     "request_purpose": "chat.message",
     "log_dir": "logs",
     "log_requests": True,
-    "strip_model_prefix": True,   # accept "imodel/deepseek-v4-flash-0731"
+    "strip_model_prefix": True,   # accept "imodel/deepseek-v4-flash-1017"
 
     # account pool --------------------------------------------------------
     "accounts_file": "accounts.json",

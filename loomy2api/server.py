@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import os
+import select
 import socket
 import threading
 import time
@@ -87,8 +88,11 @@ def _estimate_tokens(messages, tools):
             continue
         total += 8
         text = _msg_text(msg)
-        total += sum(1 for ch in text if ord(ch) > 127)
-        total += sum(1 for ch in text if ord(ch) <= 127) // 4
+        # 与原逐字生成器完全等价的计数，但走 C 实现：
+        # encode('ascii', 'ignore') 只保留 ord <= 127 的字符，
+        # 其长度即 ASCII 字符数，其余均为非 ASCII 字符。
+        ascii_n = len(text.encode('ascii', 'ignore'))
+        total += (len(text) - ascii_n) + ascii_n // 4
     if tools:
         try:
             total += len(json.dumps(tools, ensure_ascii=False)) // 4
@@ -132,12 +136,18 @@ def _compress_messages(messages, tools, context_length, max_output, threshold=0.
     if len(blocks) <= 1:
         return messages, None
     kept = list(blocks)
-    while len(kept) > 1:
-        candidate = system + [m for b in kept[1:] for m in b]
-        if _estimate_tokens(candidate, tools) + int(max_output or 0) <= goal:
-            kept = kept[1:]
-            break
-        kept = kept[1:]
+    # 各 block 的 token 数只算一次（原代码每丢一个 block 就把剩余全部
+    # 重算一遍：N 个 block 就是 N 次全量估算，巨型 prompt 下直接卡死）。
+    # 每条消息的 token 贡献是可加的，tools 只计一次，与原算术完全等价。
+    block_tokens = [_estimate_tokens(b, None) for b in kept]
+    system_tokens = _estimate_tokens(system, tools)
+    max_out = int(max_output or 0)
+    total_kept = system_tokens + sum(block_tokens)
+    drop = 0
+    while len(kept) - drop > 1 and total_kept + max_out > goal:
+        total_kept -= block_tokens[drop]
+        drop += 1
+    kept = kept[drop:]
     result = system + [m for b in kept for m in b]
     if len(result) == len(messages):
         return messages, None
@@ -284,10 +294,13 @@ class Gateway:
             data = payload.get("data") or []
             for m in data:
                 if isinstance(m, dict) and (m.get("multiplier") in (None, "", 0)):
-                    mm = re.search(r"(?:x|×)([0-9]+(?:\.[0-9]+)?)",
-                                   str(m.get("name") or ""), re.I)
-                    if mm:
-                        m["multiplier"] = float(mm.group(1))
+                    # 取名字里**最后**一个 x 倍率：型号本身就带数字
+                    # （"Spark-X2.6 正式版(限时免费)(x0.0)" 取第一个会读成 2.6，
+                    # 实际倍率是末尾的 x0.0）。2026-11-14 实锤。
+                    mms = re.findall(r"(?:x|×)([0-9]+(?:\.[0-9]+)?)",
+                                     str(m.get("name") or ""), re.I)
+                    if mms:
+                        m["multiplier"] = float(mms[-1])
             with self._models_lock:
                 self.models = data
             self.log(f"上游模型列表已刷新：{len(data)} 个")
@@ -377,11 +390,29 @@ class Gateway:
         self.log("每日自动签到已启动（每天 UTC 00:30 后执行）")
 
     def catalogue(self) -> list:
+        # Downstream model id is lowercase: upstream DeepSeek-V4.1-Flash
+        # is shown as deepseek-v4.1-flash in the outward catalogue.
+        # Upstream requests still use the capitalised id (see
+        # resolve_model); translating here on every call keeps a later
+        # upstream refresh from reverting the outward id to capitals.
+        # Same treatment for C.MODEL_FIELD_OVERRIDES: fields the upstream
+        # itself gets wrong (1017 display name, spark-x2.6 multiplier) are
+        # corrected here so /v1/models and the panel can never show the
+        # wrong value, whatever a refresh returned.
         with self._models_lock:
             if not self.models:
                 self.models = [dict(m, object="model", owned_by="loomy")
                                for m in C.FALLBACK_MODELS]
-            return list(self.models)
+            out = []
+            for m in self.models:
+                if isinstance(m, dict):
+                    if m.get("id") == "DeepSeek-V4.1-Flash":
+                        m = dict(m, id="deepseek-v4.1-flash")
+                    override = C.MODEL_FIELD_OVERRIDES.get(m.get("id") or "")
+                    if override:
+                        m = dict(m, **override)
+                out.append(m)
+            return out
 
     def max_output_tokens(self, model: str) -> int:
         # Upstream catalogue carries a per-model max_output_tokens; use it
@@ -393,16 +424,13 @@ class Gateway:
                 if isinstance(v, int) and v > 0:
                     return v
         known = {
-            "deepseek-v4-flash-0731": 384000,
+            "deepseek-v4-flash-1017": 384000,
             "DeepSeek-V4.1-Flash": 384000,
-            "MiniMax-M3": 512000,
+            "deepseek-v4.1-flash": 384000,
             "spark-x2.6": 131072,
-            "spark-x": 65536,
             "GLM-5.3-Flash": 131072,
             "qwen3.8-flash": 131072,
-            "qwen-3.8-max": 65536,
-            "Kimi-k2.6": 65536,
-            "mimo-v2.5": 131072,
+            "mimo-v2.5": 128000,
         }
         return known.get(model, 131072)
 
@@ -412,22 +440,31 @@ class Gateway:
                 v = entry.get('context_length')
                 if isinstance(v, int) and v > 0:
                     return v
-        known = {'deepseek-v4-flash-0731': 1048576, 'DeepSeek-V4.1-Flash': 1048576, 'MiniMax-M3': 1048576, 'spark-x2.6': 1048576, 'spark-x': 1048576, 'GLM-5.3-Flash': 1048576, 'qwen3.8-flash': 1000000, 'qwen-3.8-max': 1000000, 'Kimi-k2.6': 262144, 'mimo-v2.5': 1048576}
+        known = {'deepseek-v4-flash-1017': 1048576, 'DeepSeek-V4.1-Flash': 1048576, 'deepseek-v4.1-flash': 1048576, 'spark-x2.6': 1048576, 'GLM-5.3-Flash': 1048576, 'qwen3.8-flash': 1000000, 'mimo-v2.5': 1024000}
         return known.get(model, 1048576)
 
     def resolve_model(self, requested: str) -> str:
-        """Model ids are used **verbatim** — there is no alias table.
+        """Model ids are used **verbatim**, with one alias exception.
 
         Only the provider prefix is stripped (``imodel/deepseek-…`` →
         ``deepseek-…``), because several clients insist on writing it. Note that
         the upstream itself falls back to its default model when it does not
-        recognise an id (measured: ``gpt-4o-mini`` → ``deepseek-v4-flash-0731``,
-        HTTP 200), so a typo degrades instead of erroring — always check the
-        ``model`` field of the response.
+        recognise an id (measured 2026-11-14: ``gpt-4o-mini`` → ``spark-x2.6``,
+        HTTP 200; the old default ``deepseek-v4-flash-0731`` is delisted, so a
+        request for it now also lands on ``spark-x2.6``), so a typo degrades
+        instead of erroring — always check the ``model`` field of the response.
+
+        Exception: downstream ``deepseek-v4.1-flash`` (lowercase, as shown
+        in the outward catalogue) is translated to upstream
+        ``DeepSeek-V4.1-Flash``. Sending the lowercase id upstream would
+        silently fall back to the default model, so it must not pass
+        through verbatim.
         """
         name = str(requested or "").strip()
         if self.cfg.get("strip_model_prefix", True) and "/" in name:
             name = name.split("/", 1)[1].strip()
+        if name == "deepseek-v4.1-flash":
+            name = "DeepSeek-V4.1-Flash"
         return name or str(self.cfg.get("default_model") or C.DEFAULT_MODEL)
 
     # -- background ------------------------------------------------------
@@ -544,13 +581,33 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:                               # noqa: BLE001
             pass
 
-    def _run_with_keepalive(self, fn, interval: float = 15.0):
+    def _client_gone(self) -> bool:
+        """客户端是否已断开（非阻塞探测）。
+
+        select 可读 + ``recv(MSG_PEEK)`` 返回空 = 对端已发 FIN。
+        请求体早已读完，无未读数据会误判。任何异常按已断开处理。
+        """
+        try:
+            sock = self.connection
+            r, _, _ = select.select([sock], [], [], 0)
+            if not r:
+                return False
+            return sock.recv(1, socket.MSG_PEEK) == b""
+        except Exception:
+            return True
+
+    def _run_with_keepalive(self, fn, interval: float = 15.0,
+                            cancel: Optional[threading.Event] = None):
         """阻塞调用上游期间，定期写 JSON 合法的前导空白保活。
 
         Cloudflare 免费版对「无字节流动」的请求约 60~100s 就返回 504 ——
         非流式长任务（写长文 / 长代码）必然被掐（实测 62s 即 504）。
         chunked + 空白前缀让连接持续有字节流动；RFC 8259 允许 JSON 值
         前后有空白，客户端 ``json.loads()`` 直接忽略，解析不受影响。
+
+        客户端断开时（每 0.4s 探测一次，不用等 15s 的保活写失败才
+        发现）立刻置位 ``cancel`` 并返回，让工作线程停掉上游调用，
+        不再给已走的客户端白跑上游。
         """
         box: Dict[str, Any] = {}
         done = threading.Event()
@@ -566,8 +623,14 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=worker, daemon=True).start()
         last = time.time()
         while not done.wait(0.4):
+            if self._client_gone():
+                if cancel is not None:
+                    cancel.set()
+                return None                             # 客户端已断开
             if time.time() - last >= interval:
                 if not self._chunk_write(b" "):         # 前导空白，JSON 合法
+                    if cancel is not None:
+                        cancel.set()
                     return None                         # 客户端已断开
                 last = time.time()
         if "error" in box:
@@ -1080,7 +1143,10 @@ class Handler(BaseHTTPRequestHandler):
         acc = gw.pool.acquire()
         t0 = time.time()
         status, headers, data = gw.models_client.call(
-            acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {})
+            acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {},
+            # 生图是单次回包、生成期间零字节流动，空闲超时不适用；
+            # 保持长时限显式传入，不跟随聊天路径的 120s 默认。
+            timeout=float(gw.cfg.get("timeout") or 3600))
         # 记账：生图一次扣上百积分，之前完全不进台账，「用量」页自然是错的。
         # points 在响应**顶层**（images/generations 无 usage 对象，实测）。
         try:
@@ -1122,7 +1188,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------- chat (core)
 
     def _chat_stream_to_json(self, req: Dict[str, Any], extra: Dict[str, str],
-                             model: str, skey: Optional[str] = None) -> Tuple[int, bytes]:
+                             model: str, skey: Optional[str] = None,
+                             cancel: Optional[threading.Event] = None) -> Tuple[int, bytes]:
         """非流式长任务 → **用流式调上游** → 聚合回 OpenAI 非流式 JSON。
 
         实测：上游对「长时间无响应」的非流式请求会在 ~60s 返回 504
@@ -1137,6 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+            if cancel is not None and cancel.is_set():
+                return last                             # 客户端已走，不换号重试
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model,
                                       session_key_value=skey)
@@ -1179,6 +1248,8 @@ class Handler(BaseHTTPRequestHandler):
             buffer = b""
             try:
                 while True:
+                    if cancel is not None and cancel.is_set():
+                        return last                     # 客户端已走，停掉聚合
                     chunk = resp.read(4096)
                     if not chunk:
                         break
@@ -1222,6 +1293,8 @@ class Handler(BaseHTTPRequestHandler):
                             if fn.get("arguments"):
                                 slot["args"] += fn["arguments"]
             except (TimeoutError, ConnectionError, OSError) as exc:
+                if cancel is not None and cancel.is_set():
+                    return last                         # 客户端已走，不换号重试
                 # 上游流中断/单次 read 超时（stream_idle_timeout）：之前这里
                 # 没有 except，异常直接炸到外层 502 整单失败不换账号。
                 # 现在记 504 → continue failover 换账号重新聚合。
@@ -1601,7 +1674,7 @@ class Handler(BaseHTTPRequestHandler):
         # image 等非 chat 模型打 chat/completions 上游必 404，还会把账号
         # 打进冷却。这里直接 400 快速失败并指路正确端点（不打上游、不冷却）。
         _entry = next((m for m in gw.catalogue()
-                       if isinstance(m, dict) and m.get("id") == model), None)
+                       if isinstance(m, dict) and (m.get("id") == model or (model == "DeepSeek-V4.1-Flash" and m.get("id") == "deepseek-v4.1-flash"))), None)
         if _entry and _entry.get("type") not in (None, "", "chat"):
             return self._error(
                 400, f"模型 {model} 是 {_entry.get('type')} 类型，"
@@ -1734,8 +1807,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # 长任务：内部转流式取数（上游非流式 ~60s 就 504），
                 # 聚合后仍以非流式 JSON 返回，客户端无感。
+                _cancel = threading.Event()
                 res = self._run_with_keepalive(
-                    lambda: self._chat_stream_to_json(req, extra, model, skey))
+                    lambda: self._chat_stream_to_json(req, extra, model, skey,
+                                                      cancel=_cancel),
+                    cancel=_cancel)
             except Exception as exc:                    # noqa: BLE001
                 res = (502, json.dumps({"error": {
                     "message": str(exc), "type": "upstream_error", "code": 502}
@@ -1859,14 +1935,29 @@ class Handler(BaseHTTPRequestHandler):
         buffer = b""
         # 首块已经在上面的探测里读出来了 —— 直接转发给客户端，别丢
         if first_chunk:
-            self.wfile.write(first_chunk)
-            self.wfile.flush()
+            try:
+                self.wfile.write(first_chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                # 客户端在首块发出前已断开：之前这里在 try 之外，直接抛
+                # 堆栈到日志；现在正常收尾（下面 try 的 finally 不会执行，
+                # 这里显式放号、关上游连接）。
+                gw.log(f"[call] {acc.name} {model} client disconnected")
+                gw.pool.release(acc)
+                try:
+                    conn.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+                return
             buffer += first_chunk
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 sse_usage(line.strip(), usage)
         try:
             while True:
+                if self._client_gone():
+                    gw.log(f"[call] {acc.name} {model} client disconnected")
+                    return                              # finally 放号、关连接
                 chunk = resp.read(4096)
                 if not chunk:
                     break
@@ -1942,8 +2033,11 @@ class Handler(BaseHTTPRequestHandler):
         if _orig_max >= min_tok:
             self._chunked_open()
             try:
+                _cancel = threading.Event()
                 res = self._run_with_keepalive(
-                    lambda: self._chat_stream_to_json(payload, {}, model, skey))
+                    lambda: self._chat_stream_to_json(payload, {}, model, skey,
+                                                      cancel=_cancel),
+                    cancel=_cancel)
             except Exception as exc:                    # noqa: BLE001
                 res = (502, json.dumps({"error": {
                     "message": str(exc), "type": "upstream_error", "code": 502}
@@ -1981,7 +2075,11 @@ class Handler(BaseHTTPRequestHandler):
             started = time.time()
             try:
                 status, _h, data = gw.models_client.call(
-                    acc.session, "chat/completions", payload, proxy=acc.proxy or None)
+                    acc.session, "chat/completions", payload, proxy=acc.proxy or None,
+                    # 非流式单次回包：sock timeout 就是总时长，空闲概念不适用；
+                    # 之前这里没传超时、走 3600 默认，120s 会误杀慢生成，
+                    # 所以保持 3600 显式传入（与生图 _passthrough 同理）。
+                    timeout=float(gw.cfg.get("timeout") or 3600))
             finally:
                 gw.pool.release(acc)
             if status == 200:
@@ -2035,7 +2133,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 conn, resp = gw.models_client.stream(
                     acc.session, "chat/completions", payload,
-                    proxy=acc.proxy or None)
+                    proxy=acc.proxy or None,
+                    timeout=float(gw.cfg.get("stream_idle_timeout") or 120))
             except Exception as exc:                    # noqa: BLE001
                 gw.pool.release(acc)
                 gw.log(f"[messages] {acc.name} {model} stream 连接异常：{exc}")
@@ -2093,6 +2192,9 @@ class Handler(BaseHTTPRequestHandler):
             for event, data in translator.start():
                 emit(event, data)
             while True:
+                if self._client_gone():
+                    gw.log(f"[messages] {acc.name} {model} client disconnected")
+                    return                              # finally 放号、关连接
                 chunk = resp.read(4096)
                 if not chunk:
                     break

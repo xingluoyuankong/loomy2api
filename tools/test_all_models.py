@@ -14,11 +14,10 @@ d = json.load(open('accounts.json', encoding='utf-8'))
 accs = d['accounts'] if isinstance(d, dict) and 'accounts' in d else d
 sess, proxy = accs[0]['session'], (accs[0].get('proxy') or None)
 
-CHAT = ['deepseek-v4-flash-0731', 'MiniMax-M3', 'Kimi-k2.6', 'qwen-3.8-max',
-        'GLM-5.3-Flash', 'qwen3.8-flash', 'spark-x', 'mimo-v2.5']
+CHAT = ['deepseek-v4-flash-1017', 'DeepSeek-V4.1-Flash',
+        'GLM-5.3-Flash', 'qwen3.8-flash', 'spark-x2.6', 'mimo-v2.5']
 IMAGES = ['Hy-Image-3.5-preview', 'doubao-seedream-5-lite', 'qwen-image-3.0-pro']
-# qwen-3.8-max 倍率 x12，限量省积分
-BUDGET = {'qwen-3.8-max': 40}
+BUDGET = {}
 
 TOOL = [{
     'type': 'function',

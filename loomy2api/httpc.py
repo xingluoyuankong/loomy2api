@@ -9,6 +9,8 @@ purpose.
 from __future__ import annotations
 
 import json
+import select
+import socket
 import ssl
 from http.client import HTTPConnection, HTTPSConnection
 import threading
@@ -36,12 +38,39 @@ def _pool_key(url, proxy):
     u = _split(url)
     return (u.scheme, u.hostname, u.port or (443 if u.scheme == "https" else 80), proxy or "")
 
+def _sock_dead(sock) -> bool:
+    """True if the peer has already closed this connection.
+
+    Non-blocking probe: readable + ``recv(MSG_PEEK)`` returning ``b""``
+    means the peer sent FIN. No data pending and not readable means alive.
+    Any error means unusable. Used to keep dead keep-alive connections
+    out of the pool (they used to pile up as CLOSE-WAIT and fail once
+    on reuse before the retry path kicked in).
+    """
+    if sock is None:
+        return True
+    try:
+        r, _, _ = select.select([sock], [], [], 0)
+        if not r:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except Exception:
+        return True
+
+
 def _checkout(key, timeout):
     with _POOL_LOCK:
         lst = _POOL.get(key)
-        if not lst:
+        while lst:
+            conn = lst.pop()
+            if not _sock_dead(getattr(conn, "sock", None)):
+                break
+            try:
+                conn.close()
+            except Exception:
+                pass
+        else:
             return None
-        conn = lst.pop()
     try:
         if getattr(conn, "sock", None) is not None:
             conn.sock.settimeout(timeout)
@@ -52,6 +81,10 @@ def _checkout(key, timeout):
 def _checkin(key, conn, resp_headers):
     try:
         if getattr(conn, "sock", None) is None:
+            return
+        if _sock_dead(conn.sock):
+            # 对端已关：别放回池子，否则下次捞出来先失败一次再重试。
+            conn.close()
             return
         if "close" in str(resp_headers.get("Connection", "")).lower():
             conn.close()
@@ -147,7 +180,7 @@ def request(url: str, *, method: str = "GET", headers: Optional[dict] = None,
 
 
 def open_stream(url: str, *, method: str = "POST", headers: Optional[dict] = None,
-                body: Optional[bytes] = None, timeout: float = 3600,
+                body: Optional[bytes] = None, timeout: float = 120,
                 proxy: str = ""):
     """Open a connection without consuming the body → ``(conn, response)``.
 

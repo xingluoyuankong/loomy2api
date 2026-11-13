@@ -6,10 +6,10 @@ KEY = [l.split("=",1)[1] for l in open("/root/.loomy2api_key") if l.startswith("
 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 B = "http://127.0.0.1:17890"
 
-CHAT = ["deepseek-v4-flash-0731", "MiniMax-M3", "Kimi-k2.6", "qwen-3.8-max",
-        "GLM-5.3-Flash", "qwen3.8-flash", "spark-x", "mimo-v2.5"]
+CHAT = ["deepseek-v4-flash-1017", "DeepSeek-V4.1-Flash",
+        "GLM-5.3-Flash", "qwen3.8-flash", "spark-x2.6", "mimo-v2.5"]
 IMAGES = ["Hy-Image-3.5-preview", "doubao-seedream-5-lite", "qwen-image-3.0-pro"]
-BUDGET = {"qwen-3.8-max": 40}
+BUDGET = {}
 
 def chat(model, max_tokens, prompt):
     body = json.dumps({"model": model, "stream": False, "max_tokens": max_tokens,

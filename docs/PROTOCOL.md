@@ -1,7 +1,7 @@
 # Reversed protocol reference
 
 Everything here was derived from the official Loomy desktop client (Electron,
-version `0.9.38`) — its main-process sources ship **unencrypted** in
+version `0.9.39`) — its main-process sources ship **unencrypted** in
 `resources/app.asar.unpacked/electron/`, and its `resources/.env.prod` is
 obfuscated with a passphrase that is hard-coded in
 `electron/utils/env-file-crypto.js` of the same package.
@@ -44,7 +44,7 @@ Required headers on every model request:
 Authorization: Bearer <session>
 token: <session>                      # both spellings are accepted/sent
 traceparent: 00-<32 hex>-<16 hex>-01  # without it the upstream hangs until timeout
-loomy-version: 0.9.38                 # presence-checked only
+loomy-version: 0.9.39                 # presence-checked only
 Content-Type: application/json
 ```
 
@@ -160,7 +160,7 @@ it does not change the network origin, which is what most risk control keys on.
 
 Quota model: `availableBalance = balance (permanent) + dailyBalance (free daily
 grant, consumed first, resets each day)`. Model multipliers (`x0.1` … `x12.0`)
-scale how many points a request costs; `spark-x` at `x0.1` is the cheapest.
+scale how many points a request costs; `spark-x2.6` at `x0.0` (限时免费) is the cheapest.
 
 Reasoning models expose `reasoning_content` alongside `content`; requests may
 carry `enable_thinking: false` / `chat_template_kwargs.enable_thinking` and the

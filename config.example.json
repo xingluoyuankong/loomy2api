@@ -12,14 +12,14 @@
   "access_key_id": "",
   "access_key_secret": "",
 
-  "loomy_version": "0.9.38",
+  "loomy_version": "0.9.39",
   "_proxy": "empty = direct connection (recommended for these domestic endpoints)",
   "proxy": "",
 
   "_api_keys": "empty list = the gateway needs no key. Set e.g. [\"sk-abc\"] to require Bearer/x-api-key. 首启自动生成时这里会是随机 Key。",
   "api_keys": [],
 
-  "default_model": "deepseek-v4-flash-0731",
+  "default_model": "deepseek-v4-flash-1017",
   "_models": "Upstream model ids are used verbatim — no alias table. See GET /v1/models for the catalogue.",
 
   "timeout": 1200,
