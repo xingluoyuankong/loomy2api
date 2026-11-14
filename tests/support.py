@@ -105,6 +105,9 @@ class FakeUpstream:
         self.exhausted_sessions: List[str] = []
         #: model-id substring → (status, message); simulates upstream hiccups
         self.reject_with: Dict[str, Any] = {}
+        #: when set, chat responses report this model instead of the requested
+        #: one — simulates the upstream silently falling back to another model
+        self.serve_model: Optional[str] = None
         self.calls: List[Dict[str, Any]] = []
         self.models_payload = {
             "object": "list",
@@ -203,11 +206,12 @@ class FakeUpstream:
                     for needle, (status, message) in fake.reject_with.items():
                         if needle in str(model):
                             return fake._reject(self, status, message)
+                    served = fake.serve_model or model
                     if body.get("stream"):
-                        return self._stream(model)
+                        return self._stream(served)
                     return fake._send_json(self, {
                         "id": "chatcmpl-fake", "object": "chat.completion",
-                        "model": model,
+                        "model": served,
                         "choices": [{"index": 0, "message": {
                             "role": "assistant",
                             "content": f"echo:{body.get('messages', [{}])[-1].get('content')}"},

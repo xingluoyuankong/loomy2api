@@ -159,11 +159,56 @@ class GatewayTestCase(_Harness, unittest.TestCase):
     def test_missing_model_falls_back_to_default(self):
         _s, body, _ = self.post("/v1/chat/completions", {
             "messages": [{"role": "user", "content": "x"}]})
-        # The configured default is the outward (official) id; the response
-        # echoes the id actually sent upstream, i.e. the resolved alias.
+        # The configured default is the outward (official) id, and the
+        # response reports it too — the upstream wire id must not leak out.
         self.assertEqual(self.cfg["default_model"], "deepseek-v4.1-flash-1017")
-        self.assertEqual(json.loads(body)["model"],
-                         self.gateway.resolve_model(self.cfg["default_model"]))
+        self.assertEqual(json.loads(body)["model"], "deepseek-v4.1-flash-1017")
+
+    def test_response_model_is_outward_id_for_1017(self):
+        # 2026-11-14 newapi model test: requesting the official id must get
+        # the official id back, even though the wire id is abbreviated.
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "deepseek-v4.1-flash-1017",
+            "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(json.loads(body)["model"], "deepseek-v4.1-flash-1017")
+        # ...while upstream really received the abbreviated wire id.
+        last_call = self.upstream.calls[-1]
+        self.assertEqual(last_call["body"]["model"], "deepseek-v4-flash-1017")
+
+    def test_response_model_keeps_abbreviated_id_when_asked(self):
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "deepseek-v4-flash-1017",
+            "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(json.loads(body)["model"], "deepseek-v4-flash-1017")
+
+    def test_response_model_reports_real_fallback(self):
+        # Upstream silently serving another model must stay visible —
+        # the response must NOT be papered over with the requested name.
+        self.upstream.serve_model = "spark-x2.6"
+        try:
+            _s, body, _ = self.post("/v1/chat/completions", {
+                "model": "deepseek-v4.1-flash-1017",
+                "messages": [{"role": "user", "content": "x"}]})
+        finally:
+            self.upstream.serve_model = None
+        self.assertEqual(json.loads(body)["model"], "spark-x2.6")
+
+    def test_stream_frames_carry_outward_model(self):
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "deepseek-v4.1-flash-1017", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+        text = body.decode("utf-8")
+        self.assertIn('"model": "deepseek-v4.1-flash-1017"', text)
+        self.assertNotIn("deepseek-v4-flash-1017", text)
+        self.assertIn('"content": "hello"', text)   # content untouched
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_messages_response_model_is_outward_id(self):
+        _s, body, _ = self.post("/v1/messages", {
+            "model": "deepseek-v4.1-flash-1017", "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]})
+        payload = json.loads(body)
+        self.assertEqual(payload["model"], "deepseek-v4.1-flash-1017")
 
     def test_chat_stream(self):
         _s, body, _ = self.post("/v1/chat/completions", {

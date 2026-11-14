@@ -52,6 +52,27 @@ def _rate(usage: Dict[str, Any], elapsed: float) -> str:
     return f" {total / elapsed:.1f}tok/s" if total else ""
 
 
+def _rewrite_sse_model(line: bytes, display: str) -> bytes:
+    """Rewrite the top-level ``"model"`` of one SSE ``data:`` line to
+    ``display`` (the outward id). Only that one key is touched — the
+    content/reasoning/tool_calls bytes pass through untouched. Non-JSON,
+    ``[DONE]`` and non-data lines are returned unchanged."""
+    s = line.strip()
+    if not s.startswith(b"data:"):
+        return line
+    payload = s[5:].strip()
+    if not payload or payload == b"[DONE]":
+        return line
+    try:
+        j = json.loads(payload.decode("utf-8"))
+    except Exception:                               # noqa: BLE001
+        return line
+    if not isinstance(j, dict) or "model" not in j:
+        return line
+    j["model"] = display
+    return b"data: " + json.dumps(j, ensure_ascii=False).encode("utf-8")
+
+
 # ------------------------------------------------------------------ context compress
 # Gateway-side auto-compression, deliberately simple (owner order 2026-10-28:
 # no LLM summarisation call, no extra upstream round trip, no latency on the
@@ -448,6 +469,35 @@ class Gateway:
         known = {'deepseek-v4.1-flash-1017': 1048576, 'deepseek-v4-flash-1017': 1048576, 'DeepSeek-V4.1-Flash': 1048576, 'deepseek-v4.1-flash': 1048576, 'spark-x2.6': 1048576, 'GLM-5.3-Flash': 1048576, 'qwen3.8-flash': 1000000, 'mimo-v2.5': 1024000}
         return known.get(model, 1048576)
 
+    def outward_model_id(self, requested: str) -> str:
+        """Client-facing id for a request: the raw id with only the provider
+        prefix stripped, or the configured (outward) default when the client
+        sent none. This is what /v1/models shows and what responses report
+        (see display_model); the upstream wire id is resolve_model's job."""
+        name = str(requested or "").strip()
+        if self.cfg.get("strip_model_prefix", True) and "/" in name:
+            name = name.split("/", 1)[1].strip()
+        return name or str(self.cfg.get("default_model") or C.DEFAULT_MODEL)
+
+    def display_model(self, requested: str, served: str) -> str:
+        """Model id to report downstream for a completed call.
+
+        ``requested`` is the client's raw model string ("" = default);
+        ``served`` is the id upstream actually put in its response.
+        - served == resolve(requested) → the client got what it asked for:
+          report the OUTWARD id (the official id, e.g.
+          ``deepseek-v4.1-flash-1017``), not the upstream wire id
+          (``deepseek-v4-flash-1017``). Without this, downstream consistency
+          checks (newapi model test) see a mismatch and fail the model.
+        - otherwise upstream silently fell back to another model: report
+          ``served`` as-is, so the fallback stays detectable instead of
+          being papered over with the requested name.
+        - served missing/empty: no evidence of a fallback → outward id.
+        """
+        if not served or served == self.resolve_model(requested):
+            return self.outward_model_id(requested)
+        return served
+
     def resolve_model(self, requested: str) -> str:
         """Model ids are used **verbatim**, with two alias exceptions.
 
@@ -469,16 +519,16 @@ class Gateway:
           without this, asking for ``deepseek-v4.1-flash-1017`` silently serves
           ``spark-x2.6`` (measured 2026-11-14). The abbreviated id still passes
           through unchanged for clients that already use it.
+
+        The response side is display_model's job: it reports the outward id
+        when upstream served the resolved id, and the served id when upstream
+        silently fell back — the wire id must never leak into responses.
         """
-        name = str(requested or "").strip()
-        if self.cfg.get("strip_model_prefix", True) and "/" in name:
-            name = name.split("/", 1)[1].strip()
-        if not name:
-            # Default goes through the same alias translation below: the
-            # configured default is the outward (official) id, but upstream
-            # must receive the upstream id — returning it untranslated would
-            # silently serve the upstream default (spark-x2.6).
-            name = str(self.cfg.get("default_model") or C.DEFAULT_MODEL)
+        # Default goes through the same alias translation below: the
+        # configured default is the outward (official) id, but upstream
+        # must receive the upstream id — returning it untranslated would
+        # silently serve the upstream default (spark-x2.6).
+        name = self.outward_model_id(requested)
         if name == "deepseek-v4.1-flash":
             name = "DeepSeek-V4.1-Flash"
         if name == "deepseek-v4.1-flash-1017":
@@ -1207,7 +1257,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat_stream_to_json(self, req: Dict[str, Any], extra: Dict[str, str],
                              model: str, skey: Optional[str] = None,
-                             cancel: Optional[threading.Event] = None) -> Tuple[int, bytes]:
+                             cancel: Optional[threading.Event] = None,
+                             requested: str = "") -> Tuple[int, bytes]:
         """非流式长任务 → **用流式调上游** → 聚合回 OpenAI 非流式 JSON。
 
         实测：上游对「长时间无响应」的非流式请求会在 ~60s 返回 504
@@ -1343,7 +1394,9 @@ class Handler(BaseHTTPRequestHandler):
                     msg["content"] = None
             obj = {"id": rid or ("chatcmpl-" + uuid.uuid4().hex[:12]),
                    "object": "chat.completion", "created": created,
-                   "model": model_out or model,
+                   # 回包 model 以 display_model 为准：上游按请求服务时报对外 id，
+                   # 上游静默回落时如实报被服务的模型（不要拿请求名盖住回落）。
+                   "model": gw.display_model(requested, model_out),
                    "choices": [{"index": 0, "message": msg, "logprobs": None,
                                 "finish_reason": finish or "stop"}],
                    "usage": usage}
@@ -1367,7 +1420,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         gw = self.gateway
         req = self._read_json()
-        model = gw.resolve_model(req.get("model"))
+        requested_raw = req.get("model")
+        model = gw.resolve_model(requested_raw)
 
         messages: list = []
         instr = req.get("instructions")
@@ -1469,7 +1523,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:                           # noqa: BLE001
             return self._error(502, "上游返回非 JSON / upstream non-JSON",
                                "upstream_error")
-        resp = self._responses_from_chat(obj, model)
+        resp = self._responses_from_chat(
+            obj, gw.display_model(requested_raw, obj.get("model") or ""))
 
         if not req.get("stream"):
             return self._json(200, resp)
@@ -1669,7 +1724,9 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self) -> None:
         gw = self.gateway
         req = self._read_json()
-        model = gw.resolve_model(req.get("model"))
+        # 原始请求 id（翻回上游 id 之前）：回包 model 显示用，对外 id。
+        requested_raw = req.get("model")
+        model = gw.resolve_model(requested_raw)
         # Owner order 2026-10-28: output cap is always the model maximum.
         # The gateway previously had NO default at all -- it passed the
         # client value verbatim, so a client sending 20/120 tokens (or
@@ -1741,7 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
         self._maybe_compress(req, model)
 
         if stream:
-            return self._chat_stream(req, extra, model, skey)
+            return self._chat_stream(req, extra, model, skey, requested=requested_raw)
 
         def core() -> Tuple[int, bytes]:
             """调上游（含重试）→ ``(status, body)``，不负责写响应。"""
@@ -1828,7 +1885,8 @@ class Handler(BaseHTTPRequestHandler):
                 _cancel = threading.Event()
                 res = self._run_with_keepalive(
                     lambda: self._chat_stream_to_json(req, extra, model, skey,
-                                                      cancel=_cancel),
+                                                      cancel=_cancel,
+                                                      requested=requested_raw),
                     cancel=_cancel)
             except Exception as exc:                    # noqa: BLE001
                 res = (502, json.dumps({"error": {
@@ -1845,16 +1903,21 @@ class Handler(BaseHTTPRequestHandler):
             self._chunk_close()
             return
 
-        # 短请求：走原路径，保留精确 HTTP 状态码
+        # 短请求：走原路径，保留精确 HTTP 状态码；200 回包的 model 字段
+        # 以 display_model 为准（对外 id；静默回落时如实报被服务的模型）。
         status, data = core()
         try:
-            return self._json(status or 502, json.loads(data.decode("utf-8")))
+            obj = json.loads(data.decode("utf-8"))
         except Exception:                               # noqa: BLE001
             return self._error(status or 502, data[:500].decode("utf-8", "replace"),
                                "upstream_error")
+        if status == 200 and isinstance(obj, dict):
+            obj["model"] = gw.display_model(requested_raw, obj.get("model") or "")
+        return self._json(status or 502, obj)
 
     def _chat_stream(self, req: Dict[str, Any], extra: Dict[str, str],
-                     model: str, skey: Optional[str] = None) -> None:
+                     model: str, skey: Optional[str] = None,
+                     requested: str = "") -> None:
         gw = self.gateway
         tried: list = []
         conn = resp = None
@@ -1951,15 +2014,37 @@ class Handler(BaseHTTPRequestHandler):
 
         usage: Dict[str, Any] = {}
         buffer = b""
-        # 首块已经在上面的探测里读出来了 —— 直接转发给客户端，别丢
+        display: Optional[str] = None
+
+        def _emit_lines(data: bytes) -> bool:
+            """把 data 里的完整 SSE 行按对外 model 改写后发给客户端；
+            不完整的行尾留在 buffer 里等下一段。返回 False 表示客户端已断开。
+            对外显示名由第一个带 model 的帧决定（display_model）：上游按
+            请求服务时报对外 id，上游静默回落时如实报被服务的模型。"""
+            nonlocal buffer, display
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if display is None:
+                    try:
+                        _j = json.loads(line.strip()[5:].strip().decode("utf-8"))
+                    except Exception:                   # noqa: BLE001
+                        _j = None
+                    if isinstance(_j, dict) and _j.get("model"):
+                        display = gw.display_model(requested, _j["model"])
+                if display is not None:
+                    line = _rewrite_sse_model(line, display)
+                try:
+                    self.wfile.write(line + b"\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+                sse_usage(line.strip(), usage)
+            return True
+
+        # 首块已经在上面的探测里读出来了 —— 改写后转发给客户端，别丢
         if first_chunk:
-            try:
-                self.wfile.write(first_chunk)
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                # 客户端在首块发出前已断开：之前这里在 try 之外，直接抛
-                # 堆栈到日志；现在正常收尾（下面 try 的 finally 不会执行，
-                # 这里显式放号、关上游连接）。
+            if not _emit_lines(first_chunk):
                 gw.log(f"[call] {acc.name} {model} client disconnected")
                 gw.pool.release(acc)
                 try:
@@ -1967,10 +2052,6 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:                       # noqa: BLE001
                     pass
                 return
-            buffer += first_chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                sse_usage(line.strip(), usage)
         try:
             while True:
                 if self._client_gone():
@@ -1981,14 +2062,14 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if first_chunk_at is None:
                     first_chunk_at = time.time()
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    sse_usage(line.strip(), usage)
+                if not _emit_lines(chunk):
+                    gw.log(f"[call] {acc.name} {model} client disconnected")
+                    return
             if buffer:
-                sse_usage(buffer.strip(), usage)
+                # 最后一行可能没有尾随换行：照样改写后发出，别丢
+                if not _emit_lines(b"\n"):
+                    gw.log(f"[call] {acc.name} {model} client disconnected")
+                    return
             elapsed = time.time() - started
             ttfb = (first_chunk_at - started) if first_chunk_at else elapsed
             gw.pool.report_success(acc, usage, model=model)
@@ -2036,14 +2117,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "messages 不能为空（请求体解析失败或客户端未传）",
                                "invalid_request_error")
         payload = anth.anthropic_to_openai(req)
-        payload["model"] = gw.resolve_model(payload.get("model"))
+        # 原始请求 id（翻回上游 id 之前）：回包 model 显示用，对外 id。
+        requested_raw = payload.get("model")
+        payload["model"] = gw.resolve_model(requested_raw)
         model = payload["model"]
         _orig_max = int(payload.get("max_tokens") or 0)
         payload["max_tokens"] = gw.max_output_tokens(model)
         skey = session_key(payload)
         self._maybe_compress(payload, model)
         if req.get("stream"):
-            return self._messages_stream(payload, model, skey)
+            return self._messages_stream(payload, model, skey,
+                                         requested=requested_raw)
 
         # 长任务：内部转流式取数再聚合（上游非流式 ~60s 就 504），
         # 拿到 OpenAI JSON 后同样走 anthropic 转换，客户端无感。
@@ -2054,7 +2138,8 @@ class Handler(BaseHTTPRequestHandler):
                 _cancel = threading.Event()
                 res = self._run_with_keepalive(
                     lambda: self._chat_stream_to_json(payload, {}, model, skey,
-                                                      cancel=_cancel),
+                                                      cancel=_cancel,
+                                                      requested=requested_raw),
                     cancel=_cancel)
             except Exception as exc:                    # noqa: BLE001
                 res = (502, json.dumps({"error": {
@@ -2072,7 +2157,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:                           # noqa: BLE001
                 obj = None
             if status == 200 and isinstance(obj, dict) and obj.get("choices"):
-                out = json.dumps(anth.openai_to_anthropic(obj, model),
+                # obj["model"] 已由 _chat_stream_to_json 按 display_model 归一，
+                # 转换器收到的就是对外 id（不要再传解析后的上游 id）。
+                out = json.dumps(anth.openai_to_anthropic(obj, obj.get("model") or model),
                                  ensure_ascii=False).encode("utf-8")
             else:
                 out = data                              # 上游错误体原样透传
@@ -2109,7 +2196,8 @@ class Handler(BaseHTTPRequestHandler):
                                 latency=elapsed, kind="messages", proxy=acc.proxy)
                 gw.log(f"[messages] {acc.name} {model} {elapsed:.1f}s "
                        f"http=200 {human_usage(usage)}{_rate(usage, elapsed)}")
-                return self._json(200, anth.openai_to_anthropic(obj, model))
+                return self._json(200, anth.openai_to_anthropic(
+                    obj, gw.display_model(requested_raw, obj.get("model") or "")))
             last = (status, data)
             reason = data[:200].decode("utf-8", "replace")
             gw.usage.record(account=acc.name, model=model, status=status,
@@ -2133,7 +2221,8 @@ class Handler(BaseHTTPRequestHandler):
                       "message": data[:500].decode("utf-8", "replace")}})
 
     def _messages_stream(self, payload: Dict[str, Any], model: str,
-                         skey: Optional[str] = None) -> None:
+                         skey: Optional[str] = None,
+                         requested: str = "") -> None:
         gw = self.gateway
         tried: list = []
         conn = resp = None
@@ -2189,7 +2278,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(resp.status, {"type": "error", "error": {
                 "type": "api_error", "message": data[:500].decode("utf-8", "replace")}})
 
-        translator = anth.StreamTranslator(model)
+        # 流式 message_start 在首帧上游块之前就发出，那时还不知道上游实际
+        # 服务了哪个模型，所以先按对外 id 发；静默回落在这个流式路径里无法
+        # 事后纠正（非流式路径会如实报被服务的模型）。
+        translator = anth.StreamTranslator(gw.outward_model_id(requested))
         first_chunk_at: Optional[float] = None
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
